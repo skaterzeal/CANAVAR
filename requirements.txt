@@ -1,0 +1,18 @@
+# ============================================================
+# Canavar Port Scanner v2026 - Dependencies
+# ============================================================
+# This tool works with ZERO external dependencies!
+# All features below are OPTIONAL enhancements.
+# ============================================================
+
+# Recommended: Better progress bars during scanning
+tqdm>=4.66.0
+
+# Recommended for Windows: Proper ANSI color support in CMD
+colorama>=0.4.6
+
+# Optional: Logo resizing for HTML reports (without this, raw logo is embedded)
+# Pillow>=10.0.0
+
+# Optional: SYN stealth scan support (requires root/admin privileges)
+# scapy>=2.5.0
