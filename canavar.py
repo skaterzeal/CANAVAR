@@ -27,6 +27,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from datetime import datetime, timedelta
 from html import escape as html_escape
+import email.utils
+import logging
+
+# Configure logging
+logger = logging.getLogger("canavar")
 
 # ── Optional Dependencies ──────────────────────────────────────
 try:
@@ -54,11 +59,17 @@ except ImportError:
 def _get_script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
+_logo_cache = {}
+
 def get_logo_base64(max_size=200):
     """Load logo.png from script directory and return base64 string.
+    Result is cached per max_size to avoid re-encoding.
     Attempts to resize with Pillow; falls back to raw file."""
+    if max_size in _logo_cache:
+        return _logo_cache[max_size]
     logo_path = os.path.join(_get_script_dir(), "logo.png")
     if not os.path.exists(logo_path):
+        _logo_cache[max_size] = ""
         return ""
     try:
         from PIL import Image
@@ -69,13 +80,18 @@ def get_logo_base64(max_size=200):
             img = img.convert("RGBA")
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
-        return base64.b64encode(buf.getvalue()).decode()
+        result = base64.b64encode(buf.getvalue()).decode()
     except ImportError:
         # No Pillow – embed raw (may be large)
-        with open(logo_path, "rb") as f:
-            return base64.b64encode(f.read()).decode()
+        try:
+            with open(logo_path, "rb") as f:
+                result = base64.b64encode(f.read()).decode()
+        except Exception:
+            result = ""
     except Exception:
-        return ""
+        result = ""
+    _logo_cache[max_size] = result
+    return result
 
 # ── ASCII Banner ───────────────────────────────────────────────
 BANNER_ART = r"""
@@ -130,6 +146,15 @@ LANG = {
         "cve_updated": "CVE database updated",
         "cve_update_failed": "CVE update failed, using cache",
         "latency": "Latency",
+        "avg_latency": "AVG Latency",
+        "ssl_cert": "SSL Cert",
+        "scan_comparison": "SCAN COMPARISON (previous: {prev_time})",
+        "new_open_ports": "Newly Opened Ports",
+        "closed_ports_label": "Closed Ports",
+        "changed_banners": "Changed Banners",
+        "no_changes": "No changes detected.",
+        "vuln_assessment": "VULNERABILITY ASSESSMENT",
+        "no_vuln_found": "No version-based vulnerabilities found.",
     },
     "tr": {
         "scan_started": "TARAMA BAŞLADI → {target} ({time})",
@@ -172,6 +197,15 @@ LANG = {
         "cve_updated": "CVE veritabanı güncellendi",
         "cve_update_failed": "CVE güncellemesi başarısız, önbellek kullanılıyor",
         "latency": "Gecikme",
+        "avg_latency": "ORT Gecikme",
+        "ssl_cert": "SSL Sertifika",
+        "scan_comparison": "TARAMA KARŞILAŞTIRMASI (önceki: {prev_time})",
+        "new_open_ports": "Yeni Açık Portlar",
+        "closed_ports_label": "Kapanan Portlar",
+        "changed_banners": "Değişen Banner'lar",
+        "no_changes": "Değişiklik yok.",
+        "vuln_assessment": "ZAFİYET DEĞERLENDİRMESİ",
+        "no_vuln_found": "Versiyon bazlı zafiyet bulunamadı.",
     },
 }
 
@@ -190,11 +224,11 @@ TOP_PORTS = [
     1024, 2103, 6004, 1801, 5050, 19, 8031, 1041, 255, 2967,
     1049, 1048, 1053, 1054, 1056, 1064, 3703, 17, 808, 3689,
     1031, 1044, 1071, 5901, 9102, 100, 8010, 2869, 1039, 5120,
-    4001, 9000, 2105, 636, 1038, 2601, 7000, 1, 2604, 1801,
+    4001, 9000, 2105, 636, 1038, 2601, 7000, 1, 2604,
     9800, 2602, 7443, 1068, 6002, 2605, 6003, 9801, 5002, 9802,
-    6004, 1058, 1059, 1060, 1062, 1063, 1065, 1066, 1069, 1070,
+    1058, 1059, 1060, 1062, 1063, 1065, 1066, 1069, 1070,
     8028, 2222, 4444, 3283, 1080, 8291, 9001, 18080, 8082, 8083,
-    8084, 8085, 8086, 8087, 8088, 8089, 27017, 5432, 6379, 11211,
+    8084, 8085, 8086, 8087, 8088, 8089, 27017, 6379, 11211,
     9200, 9300, 5601, 8200, 4443, 8880, 2383, 2381, 1434,
 ]
 # Deduplicate while preserving order
@@ -290,7 +324,7 @@ CVE_DATABASE = {
         ("CVE-2020-9365", "Pure-FTPd out-of-bounds read"),
     ],
     "microsoft-iis": [
-        ("CVE-2024-30051", "Windows DWM elevation of privilege"),
+        ("CVE-2022-21907", "HTTP Protocol Stack RCE"),
         ("CVE-2023-36899", "ASP.NET elevation of privilege"),
     ],
     "microsoft": [
@@ -352,15 +386,13 @@ def cprint(text, color=C.RESET):
             if HAS_TQDM:
                 tqdm.write(msg)
             else:
-                print(msg)
+                print(msg, flush=True)
         except UnicodeEncodeError:
-            safe = msg.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
-                sys.stdout.encoding or "utf-8", errors="replace"
-            )
+            safe = msg.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
             if HAS_TQDM:
                 tqdm.write(safe)
             else:
-                print(safe)
+                print(safe, flush=True)
 
 # ── Banner Grabbing ────────────────────────────────────────────
 def grab_banner(target, port, timeout=2, is_ipv6=False):
@@ -429,30 +461,49 @@ def grab_banner(target, port, timeout=2, is_ipv6=False):
         return ""
 
 
+def _tcp_connect(target, port, timeout, is_ipv6=False):
+    """Create a TCP connection using the correct address family. Returns a connected socket."""
+    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+    s = socket.socket(af, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((target, port))
+    except Exception:
+        s.close()
+        raise
+    return s
+
+
 def _grab_https_banner(target, port, timeout, is_ipv6=False):
     """Grab banner via TLS connection."""
     try:
-        af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection((target, port), timeout=timeout, family=af) as raw:
+        raw = _tcp_connect(target, port, timeout, is_ipv6)
+        try:
             with ctx.wrap_socket(raw, server_hostname=target) as s:
                 s.sendall(f"HEAD / HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode())
                 banner = s.recv(1024).decode(errors="ignore").strip()
                 return banner[:300] if banner else ""
-    except Exception:
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("HTTPS banner grab failed for %s:%d: %s", target, port, e)
         return ""
 
 # ── SSL/TLS Certificate Analysis ──────────────────────────────
 def get_ssl_cert_info(target, port, timeout=3, is_ipv6=False):
     """Extract SSL certificate information."""
     try:
-        af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection((target, port), timeout=timeout, family=af) as raw:
+        ctx.verify_mode = ssl.CERT_OPTIONAL
+        raw = _tcp_connect(target, port, timeout, is_ipv6)
+        try:
             with ctx.wrap_socket(raw, server_hostname=target) as s:
                 cert = s.getpeercert()
                 if not cert:
@@ -468,20 +519,26 @@ def get_ssl_cert_info(target, port, timeout=3, is_ipv6=False):
                     "subjectAltName": [x[1] for x in cert.get("subjectAltName", [])],
                 }
 
-                # Parse dates
-                import email.utils
+                # Parse dates — use timezone-aware comparison
                 if result["notAfter"]:
                     try:
                         not_after = email.utils.parsedate_to_datetime(result["notAfter"])
-                        days_left = (not_after - datetime.now()).days
+                        now = datetime.now(not_after.tzinfo) if not_after.tzinfo else datetime.now()
+                        days_left = (not_after - now).days
                         result["days_until_expiry"] = days_left
                         result["expired"] = days_left < 0
                         result["expiring_soon"] = 0 <= days_left < 30
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("SSL cert date parse error: %s", e)
 
                 return result
-    except Exception:
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("SSL cert info failed for %s:%d: %s", target, port, e)
         return None
 
 # ── CVE Matching ───────────────────────────────────────────────
@@ -513,9 +570,14 @@ def is_admin():
         return os.geteuid() == 0
 
 # ── CVE Database Update ────────────────────────────────────────
+def _get_cve_cache_path():
+    """Return the CVE cache file path in the script directory."""
+    return os.path.join(_get_script_dir(), "cve_cache.json")
+
+
 def load_cve_cache():
     """Load CVE cache from file if valid."""
-    cache_file = "cve_cache.json"
+    cache_file = _get_cve_cache_path()
     try:
         if os.path.exists(cache_file):
             with open(cache_file, "r") as f:
@@ -532,7 +594,7 @@ def load_cve_cache():
 
 def save_cve_cache(cves):
     """Save CVE cache to file."""
-    cache_file = "cve_cache.json"
+    cache_file = _get_cve_cache_path()
     try:
         cache = {"timestamp": datetime.now().isoformat(), "cves": cves}
         with open(cache_file, "w") as f:
@@ -594,11 +656,19 @@ def resolve_targets(target_str):
         # Try CIDR
         if "/" in target_str:
             network = ipaddress.ip_network(target_str, strict=False)
+            # Safety limit for IPv6 CIDR — prevent iterating quintillions of hosts
+            max_hosts = 65536
+            if isinstance(network, ipaddress.IPv6Network) and network.num_addresses > max_hosts:
+                cprint(f"[!] IPv6 CIDR too large ({network.num_addresses} hosts). Limiting to first {max_hosts}.", C.YELLOW)
+            host_count = 0
             for host in network.hosts():
                 ip = str(host)
                 is_ipv6 = isinstance(host, ipaddress.IPv6Address)
                 targets.append((ip, ip, is_ipv6))
-            if not targets:  # /32 network
+                host_count += 1
+                if host_count >= max_hosts:
+                    break
+            if not targets:  # /32 or /128 network
                 ip = str(network.network_address)
                 is_ipv6 = isinstance(network.network_address, ipaddress.IPv6Address)
                 targets.append((ip, ip, is_ipv6))
@@ -659,7 +729,7 @@ def ping_host_icmp(target, timeout=1):
         if platform.system() == "Windows":
             cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), target]
         else:
-            cmd = ["ping", "-c", "1", "-W", str(int(timeout * 1000)), target]
+            cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), target]
         result = subprocess.run(cmd, capture_output=True, timeout=timeout + 1)
         return result.returncode == 0
     except Exception:
@@ -676,37 +746,68 @@ def discover_hosts(targets, timeout=3):
 
 # ── OS Fingerprinting (TTL-based) ────────────────────────────
 def os_fingerprint(target, port=80, timeout=2, is_ipv6=False):
-    """Guess OS based on TTL from initial TCP response."""
+    """Guess OS based on TTL analysis.
+    Uses ICMP ping TTL when available, falls back to banner-based heuristics.
+    Note: Pure socket getsockopt reads local TTL, not the remote host's."""
+    # Method 1: Parse TTL from ping output
+    ttl = _get_ping_ttl(target, timeout)
+    if ttl is not None:
+        if ttl <= 64:
+            return f"Linux/macOS (TTL: {ttl})"
+        elif ttl <= 128:
+            return f"Windows (TTL: {ttl})"
+        elif ttl <= 255:
+            return f"Solaris/Network Device (TTL: {ttl})"
+        else:
+            return f"Unknown (TTL: {ttl})"
+
+    # Method 2: Try connecting and reading banner for OS hints
     try:
         af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
         with socket.socket(af, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect((target, port))
+            banner = s.recv(1024).decode(errors="ignore").lower()
+            if "ubuntu" in banner or "debian" in banner:
+                return "Linux (Ubuntu/Debian)"
+            elif "centos" in banner or "red hat" in banner:
+                return "Linux (CentOS/RHEL)"
+            elif "microsoft" in banner or "windows" in banner:
+                return "Windows"
+            elif "freebsd" in banner:
+                return "FreeBSD"
+    except Exception:
+        pass
+    return None
 
-            # Try to get socket options for TTL
-            if not is_ipv6:
-                ttl = s.getsockopt(socket.IPPROTO_IP, socket.IP_TTL)
-                if ttl >= 200:
-                    return "Solaris/Network Device"
-                elif ttl >= 100:
-                    return "Windows"
-                elif ttl >= 50:
-                    return "Linux/macOS"
-                else:
-                    return "Unknown"
+
+def _get_ping_ttl(target, timeout=2):
+    """Extract TTL value from ping output."""
+    try:
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), target]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), target]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        if result.returncode == 0:
+            # Parse TTL from output (e.g., "TTL=64" or "ttl=64")
+            match = re.search(r'ttl[=:]\s*(\d+)', result.stdout, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
     except Exception:
         pass
     return None
 
 # ── Port Scanning ─────────────────────────────────────────────
-results_lock = threading.Lock()
 
-def tcp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_state=None,
-                  timeout=1.5, is_ipv6=False, retries=0):
+def tcp_scan_port(target, port, results, results_lock, lang_code, no_banner=False, dashboard_state=None,
+                  timeout=1.5, is_ipv6=False, retries=0, stop_event=None):
     """TCP Connect scan for a single port with latency recording."""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
 
     for attempt in range(retries + 1):
+        if stop_event and stop_event.is_set():
+            return
         try:
             start_time = time.time()
             with socket.socket(af, socket.SOCK_STREAM) as s:
@@ -743,7 +844,8 @@ def tcp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
                         line += C.RED + L["cve_hint"].format(cves=", ".join(c[0] for c in cves))
                     cprint(line, C.GREEN)
                     return
-        except Exception:
+        except Exception as e:
+            logger.debug("TCP scan error %s:%d attempt %d: %s", target, port, attempt, e)
             if attempt < retries:
                 time.sleep(0.2)
                 continue
@@ -751,12 +853,14 @@ def tcp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
                 pass
 
 
-def udp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_state=None,
-                  timeout=1.5, is_ipv6=False, retries=0):
+def udp_scan_port(target, port, results, results_lock, lang_code, no_banner=False, dashboard_state=None,
+                  timeout=1.5, is_ipv6=False, retries=0, stop_event=None):
     """UDP scan for a single port. Send protocol-specific probes for known services."""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
 
     for attempt in range(retries + 1):
+        if stop_event and stop_event.is_set():
+            return
         try:
             start_time = time.time()
             with socket.socket(af, socket.SOCK_DGRAM) as s:
@@ -785,7 +889,7 @@ def udp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
                     latency_ms = (time.time() - start_time) * 1000
                     service = WELL_KNOWN_PORTS.get(port, "Unknown")
                     entry = {
-                        "port": port, "state": "open|filtered", "service": service,
+                        "port": port, "state": "open", "service": service,
                         "banner": "", "scan_type": "UDP",
                         "cves": [], "cve_details": [],
                         "latency_ms": round(latency_ms, 2),
@@ -804,7 +908,8 @@ def udp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
                     return
                 except socket.timeout:
                     pass
-        except Exception:
+        except Exception as e:
+            logger.debug("UDP scan error %s:%d attempt %d: %s", target, port, attempt, e)
             if attempt < retries:
                 time.sleep(0.2)
                 continue
@@ -812,16 +917,20 @@ def udp_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
                 pass
 
 
-def syn_scan_port(target, port, results, lang_code, no_banner=False, dashboard_state=None,
-                  timeout=1.5, is_ipv6=False, retries=0):
+def syn_scan_port(target, port, results, results_lock, lang_code, no_banner=False, dashboard_state=None,
+                  timeout=1.5, is_ipv6=False, retries=0, stop_event=None):
     """SYN (half-open) scan for a single port. Requires scapy + root."""
     for attempt in range(retries + 1):
+        if stop_event and stop_event.is_set():
+            return
         try:
             start_time = time.time()
             pkt = IP(dst=target) / TCP(dport=port, flags="S")
             resp = sr1(pkt, timeout=timeout, verbose=0)
             if resp and resp.haslayer(TCP) and resp.getlayer(TCP).flags == 0x12:
                 latency_ms = (time.time() - start_time) * 1000
+                # Use our original source port (which equals resp[TCP].dport, since the
+                # target's reply swaps source/destination) so the RST matches the SYN's 4-tuple.
                 rst = IP(dst=target) / TCP(dport=port, sport=resp[TCP].dport,
                                             flags="R", seq=resp[TCP].ack)
                 send(rst, verbose=0)
@@ -848,7 +957,8 @@ def syn_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
                     line += C.RED + L["cve_hint"].format(cves=", ".join(c[0] for c in cves))
                 cprint(line, C.GREEN)
                 return
-        except Exception:
+        except Exception as e:
+            logger.debug("SYN scan error %s:%d attempt %d: %s", target, port, attempt, e)
             if attempt < retries:
                 time.sleep(0.2)
                 continue
@@ -858,10 +968,12 @@ def syn_scan_port(target, port, results, lang_code, no_banner=False, dashboard_s
 # ── Scan Orchestrator ─────────────────────────────────────────
 def run_scan(target_ip, target_name, ports, threads, use_syn, lang_code,
              no_banner=False, dashboard_state=None, timeout=1.5, udp_ports=None,
-             is_ipv6=False, retries=0):
+             is_ipv6=False, retries=0, delay=0.0):
     """Run a port scan against a single target. Returns results list."""
     L = LANG[lang_code]
     results = []
+    results_lock = threading.Lock()
+    stop_event = threading.Event()
     queue = Queue()
 
     # Add TCP/SYN ports to queue
@@ -887,18 +999,22 @@ def run_scan(target_ip, target_name, ports, threads, use_syn, lang_code,
                     colour="cyan")
 
     def worker():
-        while not queue.empty():
+        while not queue.empty() and not stop_event.is_set():
             try:
                 scan_type, port = queue.get_nowait()
             except Exception:
                 break
 
             if scan_type == "tcp":
-                scan_fn(target_ip, port, results, lang_code, no_banner, dashboard_state,
-                        timeout, is_ipv6, retries)
+                scan_fn(target_ip, port, results, results_lock, lang_code, no_banner, dashboard_state,
+                        timeout, is_ipv6, retries, stop_event)
             else:  # UDP
-                udp_scan_port(target_ip, port, results, lang_code, no_banner, dashboard_state,
-                              timeout, is_ipv6, retries)
+                udp_scan_port(target_ip, port, results, results_lock, lang_code, no_banner, dashboard_state,
+                              timeout, is_ipv6, retries, stop_event)
+
+            # Apply timing delay if configured (for stealth profiles)
+            if delay > 0:
+                time.sleep(delay)
 
             with count_lock:
                 scanned_count[0] += 1
@@ -927,9 +1043,22 @@ def run_scan(target_ip, target_name, ports, threads, use_syn, lang_code,
     return results
 
 # ── Export Functions ───────────────────────────────────────────
+def _normalize_for_json(data):
+    """Convert non-JSON-native types (tuples, datetime) into serializable forms.
+    Specifically converts cve_details tuple lists into list-of-lists so round-tripping
+    through JSON is consistent."""
+    for td in data.get("targets", []):
+        for r in td.get("results", []):
+            cd = r.get("cve_details")
+            if cd:
+                r["cve_details"] = [list(item) if isinstance(item, tuple) else item for item in cd]
+    return data
+
+
 def export_json(scan_data, filename):
+    _normalize_for_json(scan_data)
     with open(f"{filename}.json", "w", encoding="utf-8") as f:
-        json.dump(scan_data, f, indent=2, ensure_ascii=False, default=str)
+        json.dump(scan_data, f, indent=2, ensure_ascii=False)
 
 
 def export_csv(scan_data, filename):
@@ -1049,7 +1178,7 @@ class="cve-link">{html_escape(cve_id)}</a></h3>
 <input type="text" id="filter" placeholder="🔍 Filter..." /></div>
 <table><thead><tr>
 <th>{L['port']}</th><th>{L['service']}</th><th>{L['status']}</th>
-<th>{L['banner']}</th><th>{L['scan_type']}</th><th>{L['latency']}</th><th>SSL Cert</th><th>{L['cve']}</th>
+<th>{L['banner']}</th><th>{L['scan_type']}</th><th>{L['latency']}</th><th>{L['ssl_cert']}</th><th>{L['cve']}</th>
 </tr></thead><tbody>{rows_html}</tbody></table>""" if total_open > 0 else f"""<div class="no-results"><div class="icon">🔒</div><p>{L['no_open']}</p></div>"""
 
     target_display = meta.get("targets_display", meta.get("target", ""))
@@ -1162,14 +1291,14 @@ thead th,tbody td{{padding:.6rem .8rem;}}.banner-cell{{max-width:140px;}}}}
 <p class="sub">{L['report_title']}</p>
 <div class="meta">
 <div class="mi"><span>{L['target']}:</span><strong>{html_escape(target_display)}</strong></div>
-<div class="mi"><span>{L['scan_type']}:</span><strong>{html_escape(meta.get('scan_type','TCP'))}{timing_display}</strong></div>
+<div class="mi"><span>{L['scan_type']}:</span><strong>{html_escape(meta.get('scan_type','TCP'))}{html_escape(timing_display)}</strong></div>
 <div class="mi"><span>{L['generated']}:</span><strong>{html_escape(str(meta.get('end_time','')))}</strong></div>
 </div></div>
 <div class="stats">
 <div class="sc"><div class="sl">{L['ports_scanned']}</div><div class="sv">{meta.get('total_ports',0)}</div></div>
 <div class="sc"><div class="sl">{L['open_ports']}</div><div class="sv">{total_open}</div></div>
 <div class="sc"><div class="sl">{L['duration']}</div><div class="sv">{duration_str}</div></div>
-<div class="sc"><div class="sl">AVG LATENCY</div><div class="sv">{avg_latency:.1f}ms</div></div>
+<div class="sc"><div class="sl">{L['avg_latency']}</div><div class="sv">{avg_latency:.1f}ms</div></div>
 </div>
 <div class="section">
 <div class="section-header"><h2>📡 {L['open_ports']}</h2><span class="count">{total_open}</span></div>
@@ -1261,9 +1390,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _serve_state(self):
         state = self.server.dashboard_state
-        data = json.dumps({"events": state.events, "running": state.is_running})
+        with state.lock:
+            data = json.dumps({"events": list(state.events), "running": state.is_running})
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data.encode())
 
@@ -1274,7 +1405,7 @@ class _ThreadedServer(ThreadingMixIn, HTTPServer):
 
 def start_dashboard(port, state):
     """Start dashboard HTTP server in background thread."""
-    server = _ThreadedServer(("0.0.0.0", port), _DashboardHandler)
+    server = _ThreadedServer(("127.0.0.1", port), _DashboardHandler)
     server.dashboard_state = state
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -1351,6 +1482,7 @@ tbody td{{padding:.6rem 1rem;font-size:.82rem;}}
 <div class="ft">Canavar Port Scanner v2026 - Real-time Monitoring</div>
 </div><script>
 const src=new EventSource('/events');let oc=0,cc=0,st=Date.now();
+function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
 const tmr=setInterval(()=>{{document.getElementById('s-time').textContent=((Date.now()-st)/1000).toFixed(1)+'s';}},100);
 src.onmessage=(e)=>{{const ev=JSON.parse(e.data);
 if(ev.type==='port_found'){{oc++;const d=ev.data;if(d.cves)cc+=d.cves.length;
@@ -1360,9 +1492,9 @@ const r=document.createElement('tr');
 const cb=(d.cves||[]).map(c=>`<a href="https://nvd.nist.gov/vuln/detail/${{c}}" target="_blank" class="b b-c">${{c}}</a>`).join(' ')||'<span style="color:var(--tm)">-</span>';
 const lat=d.latency_ms?d.latency_ms.toFixed(1)+'ms':'-';
 const st=d.scan_type==='SYN'?'b-sy':(d.scan_type==='UDP'?'b-u':'b-t');
-r.innerHTML=`<td class="pn">${{d.target||'-'}}</td><td><span class="pn">${{d.port}}</span></td><td><span class="b b-s">${{d.service}}</span></td>
-<td><span class="b b-o">OPEN</span></td><td class="bn">${{(d.banner||'').substring(0,80)||'No banner'}}</td>
-<td><span class="b ${{st}}">${{d.scan_type}}</span></td><td>${{lat}}</td><td>${{cb}}</td>`;
+r.innerHTML=`<td class="pn">${{esc(d.target||'-')}}</td><td><span class="pn">${{d.port}}</span></td><td><span class="b b-s">${{esc(d.service)}}</span></td>
+<td><span class="b b-o">OPEN</span></td><td class="bn">${{esc((d.banner||'').substring(0,80))||'No banner'}}</td>
+<td><span class="b ${{st}}">${{esc(d.scan_type)}}</span></td><td>${{lat}}</td><td>${{cb}}</td>`;
 tb.insertBefore(r,tb.firstChild);}}
 else if(ev.type==='progress'){{document.getElementById('s-scn').textContent=ev.data.scanned+'/'+ev.data.total;}}
 else if(ev.type==='scan_complete'){{clearInterval(tmr);const s=document.getElementById('status');s.textContent='COMPLETE';
@@ -1411,33 +1543,31 @@ def compare_scans(current_data, previous_file):
 
 def print_diff_results(diff, lang_code="en"):
     """Print diff results to terminal with colors."""
+    L = LANG[lang_code]
     new, closed, changed = diff["new"], diff["closed"], diff["changed"]
     prev_time = diff["prev_meta"].get("end_time", "?")
 
     cprint(f"\n{'='*50}", C.BOLD)
-    if lang_code == "tr":
-        cprint(f"  TARAMA KARSILASTIRMASI (onceki: {prev_time})", C.BOLD + C.CYAN)
-    else:
-        cprint(f"  SCAN COMPARISON (previous: {prev_time})", C.BOLD + C.CYAN)
+    cprint(f"  {L['scan_comparison'].format(prev_time=prev_time)}", C.BOLD + C.CYAN)
     cprint(f"{'='*50}", C.BOLD)
 
     if new:
-        cprint(f"\n  [+] {'Yeni Acik Portlar' if lang_code=='tr' else 'Newly Opened Ports'}: {len(new)}", C.GREEN + C.BOLD)
+        cprint(f"\n  [+] {L['new_open_ports']}: {len(new)}", C.GREEN + C.BOLD)
         for key, r in new:
             cprint(f"      + {key} ({r['service']}) - {r.get('banner','')[:50]}", C.GREEN)
 
     if closed:
-        cprint(f"\n  [-] {'Kapanan Portlar' if lang_code=='tr' else 'Closed Ports'}: {len(closed)}", C.RED + C.BOLD)
+        cprint(f"\n  [-] {L['closed_ports_label']}: {len(closed)}", C.RED + C.BOLD)
         for key, r in closed:
             cprint(f"      - {key} ({r['service']})", C.RED)
 
     if changed:
-        cprint(f"\n  [~] {'Degisen Bannerlar' if lang_code=='tr' else 'Changed Banners'}: {len(changed)}", C.YELLOW + C.BOLD)
+        cprint(f"\n  [~] {L['changed_banners']}: {len(changed)}", C.YELLOW + C.BOLD)
         for key, old, cur in changed:
             cprint(f"      ~ {key}: '{old.get('banner','')[:40]}' -> '{cur.get('banner','')[:40]}'", C.YELLOW)
 
     if not new and not closed and not changed:
-        cprint(f"\n  {'Degisiklik yok.' if lang_code=='tr' else 'No changes detected.'}", C.DIM)
+        cprint(f"\n  {L['no_changes']}", C.DIM)
 
     cprint(f"\n{'='*50}\n", C.BOLD)
 
@@ -1535,14 +1665,13 @@ def assess_vulnerabilities(scan_data):
 
 def print_vuln_results(vulns, lang_code="en"):
     """Print vulnerability assessment results to terminal."""
+    L = LANG[lang_code]
     if not vulns:
-        msg = "Versiyon bazli zafiyet bulunamadi." if lang_code == "tr" else "No version-based vulnerabilities found."
-        cprint(f"\n  {msg}", C.DIM)
+        cprint(f"\n  {L['no_vuln_found']}", C.DIM)
         return
 
-    title = "ZAFIYET DEGERLENDIRMESI" if lang_code == "tr" else "VULNERABILITY ASSESSMENT"
     cprint(f"\n{'='*55}", C.BOLD)
-    cprint(f"  {title}", C.BOLD + C.RED)
+    cprint(f"  {L['vuln_assessment']}", C.BOLD + C.RED)
     cprint(f"{'='*55}", C.BOLD)
 
     sev_colors = {"CRITICAL": C.RED + C.BOLD, "HIGH": C.RED, "MEDIUM": C.YELLOW, "LOW": C.BLUE}
@@ -1580,8 +1709,8 @@ def main():
   python canavar.py -t 10.0.0.1 --top-ports 100 --dashboard
   python canavar.py -t target.com --top-ports 100 --vuln-scan
   python canavar.py -t server.com -p 1-1024 --diff previous_scan.json
-  python canavar.py -t 192.168.1.1 -p 80,443 --udp -p 53,161
-  python canavar.py -t 192.168.1.0/24 --discovery --skip-discovery
+  python canavar.py -t 192.168.1.1 -p 80,443 --udp --udp-ports 53,161
+  python canavar.py -t 192.168.1.0/24 --discovery --top-ports 100
   python canavar.py -t target.com --timing 2 --retries 2
   python canavar.py -t target.com --update-cve --nvd-api-key YOUR_KEY"""
     )
@@ -1621,9 +1750,10 @@ def main():
                         help="Timing profile: 0=Paranoid, 1=Sneaky, 2=Polite, 3=Normal, 4=Aggressive, 5=Insane")
     parser.add_argument("--retries", type=int, default=0,
                         help="Number of retries for failed connections (default: 0)")
-    parser.add_argument("--discovery", action="store_true",
+    discovery_group = parser.add_mutually_exclusive_group()
+    discovery_group.add_argument("--discovery", action="store_true",
                         help="Enable host discovery before scanning")
-    parser.add_argument("--skip-discovery", action="store_true",
+    discovery_group.add_argument("--skip-discovery", action="store_true",
                         help="Skip discovery and scan all hosts in CIDR")
     parser.add_argument("--os-detect", action="store_true",
                         help="Attempt OS detection based on TTL analysis")
@@ -1637,16 +1767,24 @@ def main():
     lang_code = args.lang
     L = LANG[lang_code]
 
+    # Setup verbose logging
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
     # Print banner
     cprint(BANNER_ART, C.CYAN)
 
     # Apply timing profile if specified
     threads = args.threads or 200
     timeout = args.timeout or 1.5
+    delay = 0.0
     if args.timing is not None:
         profile = TIMING_PROFILES[args.timing]
         threads = profile["threads"]
         timeout = profile["timeout"]
+        delay = profile["delay"]
         timing_name = profile["name"]
         cprint(f"[*] Timing Profile: -{args.timing} ({timing_name})", C.CYAN)
     else:
@@ -1753,7 +1891,7 @@ def main():
                 threads=threads, use_syn=use_syn, lang_code=lang_code,
                 no_banner=args.no_banner, dashboard_state=dashboard_state,
                 timeout=timeout, udp_ports=udp_ports, is_ipv6=is_ipv6,
-                retries=args.retries
+                retries=args.retries, delay=delay
             )
 
             # OS Detection
