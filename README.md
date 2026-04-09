@@ -31,7 +31,7 @@ pip install tqdm colorama
 - **UDP Scan** – Protocol-aware probes for DNS, SNMP, NTP, DHCP, TFTP
 - **Multi-threaded** – 200 threads by default, scans 1000 ports in ~3-5 seconds
 - **CIDR Support** – Scan entire subnets (e.g., `192.168.1.0/24`)
-- **IPv6 Support** – Full IPv6 address and CIDR scanning (e.g., `::1`, `2001:db8::/64`)
+- **IPv6 Support** – Full IPv6 address and CIDR scanning (e.g., `::1`, `2001:db8::/64`). Large IPv6 CIDR ranges are automatically capped at 65,536 hosts for safety
 - **Top Ports** – Scan most commonly open ports (`--top-ports 100`)
 
 ### Intelligence
@@ -55,7 +55,12 @@ pip install tqdm colorama
 
 ### Output & UX
 - **Bilingual** – Turkish and English output (`--lang tr` / `--lang en`)
+- **Reverse DNS** – Automatic hostname resolution for each target; shown in terminal and all reports
+- **Auto-Versioned Filenames** – Each scan is saved with a unique filename (`canavar_<target>_<YYYYMMDD_HHMMSS>`) so previous scans are never overwritten
+- **Custom Output Directory** (`--output-dir`) – Write all output files to a user-specified directory (created automatically if missing)
 - **Export** – JSON (with full metadata), CSV, and stunning HTML reports with glassmorphism dark theme
+- **Resizable HTML Columns** – Drag column edges in the HTML report to widen or shrink any column
+- **Per-Target Summary Cards** – HTML report displays a card per target with hostname, IP, detected OS, and open-port count
 - **Custom Logo** – Drop a `logo.png` in the project directory to brand your reports
 - **Cross-Platform** – Windows, macOS, Kali Linux
 - **Progress Bar** – Real-time tqdm progress with ETA
@@ -111,7 +116,7 @@ python canavar.py -t 10.0.0.0/24 -p 22,80,443 --no-banner -th 300
 Scan UDP ports alongside TCP. Useful for discovering DNS, SNMP, NTP and other UDP-based services:
 
 ```bash
-# UDP scan with default ports (53, 67, 68, 69, 123, 161)
+# UDP scan with default ports (53, 161, 123, 67, 68, 69)
 python canavar.py -t 192.168.1.1 --udp
 
 # UDP scan with custom ports
@@ -121,7 +126,7 @@ python canavar.py -t 10.0.0.1 --udp --udp-ports 53,161,500,1900
 python canavar.py -t target.com -p 22,80,443 --udp --udp-ports 53,161
 ```
 
-> **Note:** UDP scanning is inherently slower and less reliable than TCP. Open ports are reported as `open|filtered` since UDP cannot definitively confirm a port is open.
+> **Note:** UDP scanning is inherently slower and less reliable than TCP. Ports that return a response are reported as `open`; silent ports are not listed since UDP cannot distinguish `open` from `filtered` without a reply. Protocol-specific probes are used for DNS, SNMP, NTP, DHCP, and TFTP to elicit responses.
 
 ### IPv6 Scanning
 
@@ -137,6 +142,8 @@ python canavar.py -t 2001:db8::1 --top-ports 50
 # IPv6 with vulnerability scan
 python canavar.py -t fe80::1 -p 22,80,443 --vuln-scan
 ```
+
+> **Note:** IPv6 CIDR scanning is capped at the first 65,536 hosts to prevent infeasible scans on huge networks (e.g., a `/64` contains ~18 quintillion addresses).
 
 ### Timing Profiles
 
@@ -337,11 +344,12 @@ python canavar.py -t 192.168.1.0/24 \
 | `-th, --threads` | Thread count (overridden by timing profile) | `200` |
 | `--syn` | SYN stealth scan | `false` |
 | `--udp` | Enable UDP scanning | `false` |
-| `--udp-ports` | UDP ports to scan | `53,67,68,69,123,161` |
+| `--udp-ports` | UDP ports to scan | `53,161,123,67,68,69` |
 | `--no-banner` | Skip banner grabbing | `false` |
-| `-o, --output` | Output filename prefix | `scan_result` |
+| `-o, --output` | Output filename prefix (default: `canavar_<target>_<timestamp>`) | auto |
+| `--output-dir` | Directory where output files will be written (created if missing) | current dir |
 | `--lang` | Language: `en` or `tr` | `tr` |
-| `-v, --verbose` | Verbose output | `false` |
+| `-v, --verbose` | Enable DEBUG-level logging (shows silent exceptions) | `false` |
 | `--timeout` | Socket timeout in seconds | `1.5` |
 | `--timing, -T` | Timing profile (0-5) | - |
 | `--retries` | Retry count for failed connections | `0` |
@@ -357,9 +365,22 @@ python canavar.py -t 192.168.1.0/24 \
 
 ## Output Files
 
-- **`scan_result.json`** – Machine-readable results with full metadata, latency, SSL cert info, OS detection, and vulnerability data
-- **`scan_result.csv`** – Spreadsheet-compatible format with all fields including latency and cert info
-- **`scan_result.html`** – Beautiful dark-themed interactive report with logo, filter, sortable table, SSL certificate cards, and latency stats
+By default, each scan generates three files named `canavar_<target>_<YYYYMMDD_HHMMSS>.{json,csv,html}` in the current directory — so previous scans are never overwritten. Use `-o` to set a custom prefix or `--output-dir` to redirect output to a specific folder.
+
+- **`*.json`** – Machine-readable results with full metadata: per-target hostname, OS detection, latency, SSL cert info, and vulnerability data
+- **`*.csv`** – Spreadsheet-compatible format including IP, hostname, and all scan fields
+- **`*.html`** – Dark-themed interactive report with logo, per-target summary cards (hostname · IP · OS · open ports), resizable & sortable table, filter, SSL certificate cards, and latency stats
+
+```bash
+# Custom prefix
+python canavar.py -t 192.168.1.1 --top-ports 100 -o my_scan
+
+# Save all outputs to a directory
+python canavar.py -t 192.168.1.0/24 --top-ports 100 --output-dir reports/
+
+# Combine both
+python canavar.py -t example.com -p 22,80,443 -o prod_audit --output-dir reports/weekly/
+```
 
 ## License
 

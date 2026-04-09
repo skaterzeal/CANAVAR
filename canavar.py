@@ -155,6 +155,15 @@ LANG = {
         "no_changes": "No changes detected.",
         "vuln_assessment": "VULNERABILITY ASSESSMENT",
         "no_vuln_found": "No version-based vulnerabilities found.",
+        "hostname": "Hostname",
+        "hostname_not_found": "Hostname not resolved",
+        "os_detected": "OS Detected",
+        "targets": "Targets",
+        "ip_address": "IP Address",
+        "open_count": "Open",
+        "search_placeholder": "Search targets, IP, hostname, OS…",
+        "filter_placeholder": "Filter ports, services, banners, CVE…",
+        "no_targets": "No targets to display.",
     },
     "tr": {
         "scan_started": "TARAMA BAŞLADI → {target} ({time})",
@@ -206,6 +215,15 @@ LANG = {
         "no_changes": "Değişiklik yok.",
         "vuln_assessment": "ZAFİYET DEĞERLENDİRMESİ",
         "no_vuln_found": "Versiyon bazlı zafiyet bulunamadı.",
+        "hostname": "Ana Makine Adı",
+        "hostname_not_found": "Ana makine adı çözülemedi",
+        "os_detected": "Tespit Edilen İS",
+        "targets": "Hedefler",
+        "ip_address": "IP Adresi",
+        "open_count": "Açık",
+        "search_placeholder": "Hedef, IP, ana makine, İS ara…",
+        "filter_placeholder": "Port, servis, banner, CVE filtrele…",
+        "no_targets": "Gösterilecek hedef yok.",
     },
 }
 
@@ -744,6 +762,20 @@ def discover_hosts(targets, timeout=3):
             alive.append((display_name, ip, is_ipv6))
     return alive
 
+
+def reverse_dns_lookup(ip, timeout=2):
+    """Reverse DNS lookup — resolve an IP to its hostname. Returns None on failure."""
+    old_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout)
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        return hostname
+    except (socket.herror, socket.gaierror, OSError, Exception) as e:
+        logger.debug("Reverse DNS failed for %s: %s", ip, e)
+        return None
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
 # ── OS Fingerprinting (TTL-based) ────────────────────────────
 def os_fingerprint(target, port=80, timeout=2, is_ipv6=False):
     """Guess OS based on TTL analysis.
@@ -1064,10 +1096,12 @@ def export_json(scan_data, filename):
 def export_csv(scan_data, filename):
     with open(f"{filename}.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Target", "Port", "State", "Service", "Banner",
+        writer.writerow(["Target", "IP", "Hostname", "Port", "State", "Service", "Banner",
                          "Scan Type", "CVE Suggestions", "Latency (ms)", "OS", "Cert Info"])
         for target_data in scan_data.get("targets", []):
             tgt = target_data["target"]
+            ip = target_data.get("ip", "")
+            hostname = target_data.get("hostname", "")
             os_detect = target_data.get("os_detection", "")
             for r in target_data["results"]:
                 cert_str = ""
@@ -1076,7 +1110,7 @@ def export_csv(scan_data, filename):
                     cn = cert.get("subject", {}).get("commonName", "")
                     cert_str = f"CN={cn}"
                 writer.writerow([
-                    tgt, r["port"], r["state"], r["service"],
+                    tgt, ip, hostname, r["port"], r["state"], r["service"],
                     r["banner"], r["scan_type"], "; ".join(r["cves"]),
                     r.get("latency_ms", ""), os_detect, cert_str
                 ])
@@ -1106,8 +1140,28 @@ def generate_html_report(scan_data, lang_code="en"):
     for td in scan_data.get("targets", []):
         for r in td["results"]:
             r["_target"] = td["target"]
+            r["_ip"] = td.get("ip", td["target"])
+            r["_hostname"] = td.get("hostname", "")
             r["_os"] = td.get("os_detection", "")
             all_results.append(r)
+
+    # Per-target summary rows (compact table — works for 1 or 500+ targets)
+    targets_rows_html = ""
+    for td in scan_data.get("targets", []):
+        hn = td.get("hostname", "")
+        os_d = td.get("os_detection", "") or "—"
+        tgt_name = td.get("target", "")
+        ip_str = td.get("ip", "")
+        open_count = td.get("open_count", 0)
+        hn_cell = html_escape(hn) if hn else f'<span class="text-muted">{html_escape(L["hostname_not_found"])}</span>'
+        open_cls = "badge-open" if open_count > 0 else "badge-neutral"
+        targets_rows_html += f"""<tr>
+<td class="mono" title="{html_escape(tgt_name)}">{html_escape(tgt_name)}</td>
+<td class="mono" title="{html_escape(ip_str)}">{html_escape(ip_str)}</td>
+<td title="{html_escape(hn)}">{hn_cell}</td>
+<td title="{html_escape(os_d)}"><span class="os-badge">{html_escape(os_d)}</span></td>
+<td><span class="badge {open_cls}">{open_count}</span></td>
+</tr>\n"""
 
     all_cves = {}
     for r in all_results:
@@ -1143,7 +1197,9 @@ def generate_html_report(scan_data, lang_code="en"):
             status = "🔴" if cert.get("expired") else ("🟡" if cert.get("expiring_soon") else "🟢")
             cert_info_html = f'<span class="badge badge-cert">{status} {cn}</span>'
 
+        host_col = html_escape(r.get("_hostname") or r.get("_ip") or r.get("_target") or "")
         rows_html += f"""<tr>
+<td class="host-cell" title="{host_col}">{host_col}</td>
 <td><span class="port-num">{r['port']}</span></td>
 <td><span class="badge badge-service">{html_escape(r['service'])}</span></td>
 <td><span class="badge badge-open">● OPEN</span></td>
@@ -1175,11 +1231,35 @@ class="cve-link">{html_escape(cve_id)}</a></h3>
 {cve_cards}</div>"""
 
     table_content = f"""<div class="filter-bar">
-<input type="text" id="filter" placeholder="🔍 Filter..." /></div>
-<table><thead><tr>
+<input type="text" id="filter" placeholder="🔍 {html_escape(L['filter_placeholder'])}" /></div>
+<div class="table-wrap"><table class="xl-table" data-table="ports"><colgroup>
+<col style="width:180px"><col style="width:80px"><col style="width:120px"><col style="width:90px">
+<col style="width:260px"><col style="width:90px"><col style="width:100px"><col style="width:160px"><col style="width:200px">
+</colgroup><thead><tr>
+<th>{L['hostname']}/{L['target']}</th>
 <th>{L['port']}</th><th>{L['service']}</th><th>{L['status']}</th>
 <th>{L['banner']}</th><th>{L['scan_type']}</th><th>{L['latency']}</th><th>{L['ssl_cert']}</th><th>{L['cve']}</th>
-</tr></thead><tbody>{rows_html}</tbody></table>""" if total_open > 0 else f"""<div class="no-results"><div class="icon">🔒</div><p>{L['no_open']}</p></div>"""
+</tr></thead><tbody>{rows_html}</tbody></table></div>""" if total_open > 0 else f"""<div class="no-results"><div class="icon">🔒</div><p>{L['no_open']}</p></div>"""
+
+    # Targets summary section — compact Excel-like table (scales to 500+ targets)
+    target_count = len(scan_data.get('targets', []))
+    if targets_rows_html:
+        targets_section = f"""<div class="section">
+<div class="section-header"><h2>🖥 {html_escape(L['targets'])}</h2><span class="count">{target_count}</span></div>
+<div class="filter-bar">
+<input type="text" id="targets-filter" placeholder="🔍 {html_escape(L['search_placeholder'])}" /></div>
+<div class="table-wrap table-wrap-targets"><table class="xl-table" data-table="targets"><colgroup>
+<col style="width:200px"><col style="width:180px"><col style="width:240px"><col style="width:180px"><col style="width:90px">
+</colgroup><thead><tr>
+<th>{html_escape(L['target'])}</th>
+<th>{html_escape(L['ip_address'])}</th>
+<th>{html_escape(L['hostname'])}</th>
+<th>{html_escape(L['os_detected'])}</th>
+<th>{html_escape(L['open_count'])}</th>
+</tr></thead><tbody>{targets_rows_html}</tbody></table></div>
+</div>"""
+    else:
+        targets_section = ""
 
     target_display = meta.get("targets_display", meta.get("target", ""))
     duration_str = f"{meta.get('duration_seconds', 0):.2f}s"
@@ -1202,7 +1282,7 @@ body::before{{content:'';position:fixed;inset:0;
 background:radial-gradient(ellipse at 20% 50%,rgba(6,182,212,.08) 0%,transparent 50%),
 radial-gradient(ellipse at 80% 20%,rgba(139,92,246,.08) 0%,transparent 50%),
 radial-gradient(ellipse at 50% 80%,rgba(16,185,129,.05) 0%,transparent 50%);pointer-events:none;z-index:0;}}
-.wrap{{max-width:1260px;margin:0 auto;padding:2rem;position:relative;z-index:1;}}
+.wrap{{max-width:1600px;margin:0 auto;padding:2rem;position:relative;z-index:1;}}
 .header{{text-align:center;padding:2.5rem 2rem;margin-bottom:2rem;
 background:linear-gradient(135deg,rgba(6,182,212,.1),rgba(139,92,246,.1));
 border:1px solid var(--brd);border-radius:20px;backdrop-filter:blur(10px);animation:fadeDown .6s ease-out;}}
@@ -1239,14 +1319,39 @@ font-size:.78rem;font-weight:600;font-family:'JetBrains Mono',monospace;}}
 .filter-bar input{{width:100%;padding:.5rem .8rem;background:rgba(255,255,255,.05);border:1px solid var(--brd);
 border-radius:8px;color:var(--t1);font-size:.85rem;outline:none;transition:border-color .2s;}}
 .filter-bar input:focus{{border-color:var(--cyan);}}
-table{{width:100%;border-collapse:collapse;}}
-thead th{{padding:.8rem 1.2rem;text-align:left;font-size:.72rem;font-weight:600;text-transform:uppercase;
-letter-spacing:.05em;color:var(--tm);background:rgba(0,0,0,.2);border-bottom:1px solid var(--brd);cursor:pointer;
-user-select:none;transition:color .2s;}}
-thead th:hover{{color:var(--cyan);}}
-tbody tr{{border-bottom:1px solid rgba(255,255,255,.03);transition:background .2s;}}
-tbody tr:hover{{background:rgba(255,255,255,.03);}}
-tbody td{{padding:.8rem 1.2rem;font-size:.85rem;}}
+/* ── Excel-like scrollable table ─────────────────────────── */
+.table-wrap{{overflow:auto;max-height:70vh;position:relative;scrollbar-width:thin;
+scrollbar-color:rgba(255,255,255,.15) transparent;}}
+.table-wrap-targets{{max-height:45vh;}}
+.table-wrap::-webkit-scrollbar{{width:10px;height:10px;}}
+.table-wrap::-webkit-scrollbar-track{{background:rgba(0,0,0,.2);}}
+.table-wrap::-webkit-scrollbar-thumb{{background:rgba(255,255,255,.15);border-radius:5px;}}
+.table-wrap::-webkit-scrollbar-thumb:hover{{background:rgba(6,182,212,.4);}}
+table{{border-collapse:separate;border-spacing:0;}}
+table.xl-table{{table-layout:fixed;width:max-content;min-width:100%;}}
+table.xl-table th,table.xl-table td{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+border-right:1px solid rgba(255,255,255,.04);}}
+table.xl-table th:last-child,table.xl-table td:last-child{{border-right:none;}}
+table.xl-table th{{position:sticky;top:0;z-index:2;padding:.7rem 1rem;text-align:left;font-size:.7rem;
+font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--tm);
+background:#14142a;border-bottom:1px solid var(--brd);cursor:pointer;user-select:none;transition:color .2s;}}
+table.xl-table th:hover{{color:var(--cyan);}}
+table.xl-table th .resizer{{position:absolute;right:0;top:0;bottom:0;width:8px;cursor:col-resize;
+user-select:none;background:transparent;transition:background .15s;z-index:3;}}
+table.xl-table th .resizer:hover,table.xl-table th .resizer.active{{background:var(--cyan);}}
+table.xl-table th{{position:sticky;}}
+table.xl-table thead th{{position:sticky;top:0;}}
+table.xl-table thead th{{position:-webkit-sticky;position:sticky;}}
+.host-cell,.mono{{font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--t1);}}
+.os-badge{{display:inline-block;max-width:100%;background:rgba(6,182,212,.12);color:var(--cyan);
+padding:.15rem .55rem;border-radius:100px;font-size:.7rem;font-weight:600;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;}}
+tbody tr{{border-bottom:1px solid rgba(255,255,255,.03);transition:background .15s;}}
+tbody tr:hover{{background:rgba(6,182,212,.06);}}
+tbody tr:nth-child(even){{background:rgba(255,255,255,.015);}}
+tbody tr:nth-child(even):hover{{background:rgba(6,182,212,.06);}}
+tbody td{{padding:.7rem 1rem;font-size:.82rem;position:relative;}}
+.badge-neutral{{background:rgba(148,163,184,.15);color:var(--t2);}}
 .port-num{{font-family:'JetBrains Mono',monospace;font-weight:600;color:var(--cyan);}}
 .badge{{display:inline-flex;align-items:center;padding:.18rem .55rem;border-radius:100px;
 font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap;}}
@@ -1258,8 +1363,7 @@ font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em;wh
 .badge-cert{{background:rgba(100,200,100,.15);color:#64c864;}}
 .badge-cve{{background:rgba(239,68,68,.15);color:var(--red);text-decoration:none;transition:background .2s;margin:.1rem;}}
 .badge-cve:hover{{background:rgba(239,68,68,.25);}}
-.banner-cell{{font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--t2);max-width:320px;
-overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+.banner-cell{{font-family:'JetBrains Mono',monospace;font-size:.76rem;color:var(--t2);}}
 .cve-list{{display:flex;gap:.3rem;flex-wrap:wrap;}}
 .text-muted{{color:var(--tm);font-size:.8rem;}}
 .cve-section{{animation:fadeUp .6s ease-out .5s both;}}
@@ -1278,7 +1382,7 @@ display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1
 @keyframes fadeUp{{from{{opacity:0;transform:translateY(20px)}}to{{opacity:1;transform:translateY(0)}}}}
 @media(max-width:768px){{.wrap{{padding:1rem;}}.header h1{{font-size:1.75rem;}}
 .stats{{grid-template-columns:repeat(2,1fr);}}.header .meta{{flex-direction:column;align-items:center;gap:.5rem;}}
-thead th,tbody td{{padding:.6rem .8rem;}}.banner-cell{{max-width:140px;}}}}
+thead th,tbody td{{padding:.6rem .8rem;}}}}
 @media(max-width:480px){{.stats{{grid-template-columns:1fr;}}}}
 @media print{{body{{background:#fff;color:#1a1a1a;}}body::before{{display:none;}}
 .sc,.section,.header{{border-color:#ddd;backdrop-filter:none;background:#f8f8f8;}}
@@ -1300,6 +1404,7 @@ thead th,tbody td{{padding:.6rem .8rem;}}.banner-cell{{max-width:140px;}}}}
 <div class="sc"><div class="sl">{L['duration']}</div><div class="sv">{duration_str}</div></div>
 <div class="sc"><div class="sl">{L['avg_latency']}</div><div class="sv">{avg_latency:.1f}ms</div></div>
 </div>
+{targets_section}
 <div class="section">
 <div class="section-header"><h2>📡 {L['open_ports']}</h2><span class="count">{total_open}</span></div>
 {table_content}
@@ -1308,18 +1413,70 @@ thead th,tbody td{{padding:.6rem .8rem;}}.banner-cell{{max-width:140px;}}}}
 <div class="footer">Canavar Port Scanner v2026 &bull; {L['generated']}: {html_escape(str(meta.get('end_time','')))}</div>
 </div>
 <script>
-document.querySelectorAll('thead th').forEach((th,i)=>{{th.addEventListener('click',()=>{{
-const tb=th.closest('table').querySelector('tbody');
-const rows=Array.from(tb.querySelectorAll('tr'));
-const d=th.dataset.d==='a'?'d':'a';th.dataset.d=d;
-rows.sort((a,b)=>{{const av=a.cells[i].textContent.trim(),bv=b.cells[i].textContent.trim();
-const an=parseInt(av),bn=parseInt(bv);
-if(!isNaN(an)&&!isNaN(bn))return d==='a'?an-bn:bn-an;
-return d==='a'?av.localeCompare(bv):bv.localeCompare(av);}});
-rows.forEach(r=>tb.appendChild(r));}});}});
-const fi=document.getElementById('filter');
-if(fi){{fi.addEventListener('input',e=>{{const v=e.target.value.toLowerCase();
-document.querySelectorAll('tbody tr').forEach(r=>{{r.style.display=r.textContent.toLowerCase().includes(v)?'':'none';}});}});}}
+// ── Excel-like table behavior: resize via <colgroup>, sort, per-table filter ──
+document.querySelectorAll('table.xl-table').forEach(function(tbl){{
+  var cols=tbl.querySelectorAll('colgroup > col');
+  var ths=tbl.querySelectorAll('thead th');
+  // Resizers (one per header, acts on the matching <col>)
+  ths.forEach(function(th,i){{
+    var grip=document.createElement('div');
+    grip.className='resizer';
+    th.appendChild(grip);
+    var sx=0,sw=0;
+    grip.addEventListener('mousedown',function(e){{
+      e.stopPropagation();e.preventDefault();
+      sx=e.pageX;
+      sw=cols[i]?cols[i].offsetWidth:th.offsetWidth;
+      grip.classList.add('active');
+      document.body.style.cursor='col-resize';
+      function mv(ev){{
+        var w=Math.max(60,sw+(ev.pageX-sx));
+        if(cols[i]) cols[i].style.width=w+'px';
+      }}
+      function up(){{
+        document.removeEventListener('mousemove',mv);
+        document.removeEventListener('mouseup',up);
+        grip.classList.remove('active');
+        document.body.style.cursor='';
+      }}
+      document.addEventListener('mousemove',mv);
+      document.addEventListener('mouseup',up);
+    }});
+  }});
+  // Sorting — skip when clicking the grip
+  ths.forEach(function(th,i){{
+    th.addEventListener('click',function(ev){{
+      if(ev.target.classList.contains('resizer')) return;
+      var tb=tbl.querySelector('tbody');
+      if(!tb) return;
+      var rows=Array.from(tb.querySelectorAll('tr'));
+      var d=th.dataset.d==='a'?'d':'a';
+      th.dataset.d=d;
+      rows.sort(function(a,b){{
+        var av=(a.cells[i]?a.cells[i].textContent.trim():''),
+            bv=(b.cells[i]?b.cells[i].textContent.trim():'');
+        var an=parseFloat(av),bn=parseFloat(bv);
+        if(!isNaN(an)&&!isNaN(bn)) return d==='a'?an-bn:bn-an;
+        return d==='a'?av.localeCompare(bv):bv.localeCompare(av);
+      }});
+      rows.forEach(function(r){{tb.appendChild(r);}});
+    }});
+  }});
+}});
+// Per-table filters
+function attachFilter(inputId,tableSelector){{
+  var fi=document.getElementById(inputId);
+  var tbl=document.querySelector(tableSelector);
+  if(!fi||!tbl) return;
+  fi.addEventListener('input',function(e){{
+    var v=e.target.value.toLowerCase();
+    tbl.querySelectorAll('tbody tr').forEach(function(r){{
+      r.style.display=r.textContent.toLowerCase().includes(v)?'':'none';
+    }});
+  }});
+}}
+attachFilter('filter','table[data-table="ports"]');
+attachFilter('targets-filter','table[data-table="targets"]');
 </script></body></html>"""
 
 # ── Live Dashboard ─────────────────────────────────────────────
@@ -1432,7 +1589,7 @@ def _build_dashboard_html(state):
 body{{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t1);min-height:100vh;}}
 body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 20% 50%,rgba(6,182,212,.08) 0%,transparent 50%),
 radial-gradient(ellipse at 80% 20%,rgba(139,92,246,.08) 0%,transparent 50%);pointer-events:none;}}
-.w{{max-width:1260px;margin:0 auto;padding:1.5rem;position:relative;z-index:1;}}
+.w{{max-width:1600px;margin:0 auto;padding:1.5rem;position:relative;z-index:1;}}
 .hd{{text-align:center;padding:1.5rem;margin-bottom:1.5rem;background:linear-gradient(135deg,rgba(6,182,212,.1),rgba(139,92,246,.1));
 border:1px solid var(--brd);border-radius:16px;backdrop-filter:blur(10px);}}
 .hd h1{{font-size:2rem;font-weight:800;background:linear-gradient(135deg,#06b6d4,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}}
@@ -1453,17 +1610,31 @@ background:rgba(6,182,212,.15);color:var(--cyan);animation:pulse 2s infinite;}}
 .sh{{padding:1rem 1.2rem;border-bottom:1px solid var(--brd);display:flex;align-items:center;gap:.5rem;}}
 .sh h2{{font-size:1rem;font-weight:600;}}.cnt{{background:rgba(6,182,212,.15);color:var(--cyan);padding:.15rem .6rem;
 border-radius:100px;font-size:.75rem;font-weight:600;font-family:'JetBrains Mono',monospace;}}
-table{{width:100%;border-collapse:collapse;}}thead th{{padding:.6rem 1rem;text-align:left;font-size:.7rem;font-weight:600;
-text-transform:uppercase;letter-spacing:.05em;color:var(--tm);background:rgba(0,0,0,.2);}}
+.fb{{padding:.6rem 1rem;border-bottom:1px solid var(--brd);}}
+.fb input{{width:100%;padding:.45rem .7rem;background:rgba(255,255,255,.05);border:1px solid var(--brd);
+border-radius:8px;color:var(--t1);font-size:.82rem;outline:none;}}
+.fb input:focus{{border-color:var(--cyan);}}
+.tblwrap{{overflow:auto;max-height:65vh;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.15) transparent;}}
+.tblwrap::-webkit-scrollbar{{width:10px;height:10px;}}
+.tblwrap::-webkit-scrollbar-track{{background:rgba(0,0,0,.2);}}
+.tblwrap::-webkit-scrollbar-thumb{{background:rgba(255,255,255,.15);border-radius:5px;}}
+.tblwrap::-webkit-scrollbar-thumb:hover{{background:rgba(6,182,212,.4);}}
+table{{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;}}
+thead th{{position:sticky;top:0;z-index:2;padding:.6rem 1rem;text-align:left;font-size:.7rem;font-weight:600;
+text-transform:uppercase;letter-spacing:.05em;color:var(--tm);background:#14142a;border-bottom:1px solid var(--brd);
+white-space:nowrap;}}
 tbody tr{{border-bottom:1px solid rgba(255,255,255,.03);animation:fadeIn .3s ease-out;}}
-tbody td{{padding:.6rem 1rem;font-size:.82rem;}}
+tbody tr:nth-child(even){{background:rgba(255,255,255,.015);}}
+tbody tr:hover{{background:rgba(6,182,212,.06);}}
+tbody td{{padding:.6rem 1rem;font-size:.82rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px;}}
 .pn{{font-family:'JetBrains Mono',monospace;font-weight:600;color:var(--cyan);}}
 .b{{display:inline-flex;padding:.15rem .5rem;border-radius:100px;font-size:.65rem;font-weight:600;text-transform:uppercase;}}
 .b-o{{background:rgba(16,185,129,.15);color:var(--green);}}.b-s{{background:rgba(139,92,246,.15);color:var(--purple);}}
 .b-t{{background:rgba(59,130,246,.15);color:var(--blue);}}.b-sy{{background:rgba(249,115,22,.15);color:#f97316;}}
 .b-u{{background:rgba(168,85,247,.15);color:#a855f7;}}
 .b-c{{background:rgba(239,68,68,.15);color:var(--red);text-decoration:none;margin:.1rem;}}
-.bn{{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--t2);max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+.bn{{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--t2);}}
+.hn{{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--t1);}}
 .ft{{text-align:center;padding:1.5rem;color:var(--tm);font-size:.75rem;margin-top:1rem;}}
 @keyframes fadeIn{{from{{opacity:0;transform:translateY(10px);}}to{{opacity:1;transform:translateY(0);}}}}
 @media(max-width:768px){{.sg{{grid-template-columns:repeat(2,1fr);}}}}
@@ -1477,29 +1648,43 @@ tbody td{{padding:.6rem 1rem;font-size:.82rem;}}
 <div class="sc"><div class="sl">CVE</div><div class="sv" id="s-cve">0</div></div>
 </div>
 <div class="sec"><div class="sh"><h2>Live Results</h2><span class="cnt" id="r-cnt">0</span></div>
-<table><thead><tr><th>Target</th><th>Port</th><th>Service</th><th>Status</th><th>Banner</th><th>Type</th><th>Latency</th><th>CVE</th></tr></thead>
-<tbody id="tbody"></tbody></table></div>
+<div class="fb"><input type="text" id="dfilter" placeholder="🔍 Filter targets, ports, services, banners…" /></div>
+<div class="tblwrap">
+<table><thead><tr><th>Target</th><th>Hostname</th><th>Port</th><th>Service</th><th>Status</th><th>Banner</th><th>Type</th><th>Latency</th><th>CVE</th></tr></thead>
+<tbody id="tbody"></tbody></table></div></div>
 <div class="ft">Canavar Port Scanner v2026 - Real-time Monitoring</div>
 </div><script>
 const src=new EventSource('/events');let oc=0,cc=0,st=Date.now();
+const hmap={{}};
 function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
 const tmr=setInterval(()=>{{document.getElementById('s-time').textContent=((Date.now()-st)/1000).toFixed(1)+'s';}},100);
 src.onmessage=(e)=>{{const ev=JSON.parse(e.data);
+if(ev.type==='scan_start'){{if(ev.data.target)hmap[ev.data.target]=ev.data.hostname||'';return;}}
 if(ev.type==='port_found'){{oc++;const d=ev.data;if(d.cves)cc+=d.cves.length;
+if(!d.hostname&&hmap[d.target])d.hostname=hmap[d.target];
 document.getElementById('s-opn').textContent=oc;document.getElementById('s-cve').textContent=cc;
 document.getElementById('r-cnt').textContent=oc;const tb=document.getElementById('tbody');
 const r=document.createElement('tr');
 const cb=(d.cves||[]).map(c=>`<a href="https://nvd.nist.gov/vuln/detail/${{c}}" target="_blank" class="b b-c">${{c}}</a>`).join(' ')||'<span style="color:var(--tm)">-</span>';
 const lat=d.latency_ms?d.latency_ms.toFixed(1)+'ms':'-';
 const st=d.scan_type==='SYN'?'b-sy':(d.scan_type==='UDP'?'b-u':'b-t');
-r.innerHTML=`<td class="pn">${{esc(d.target||'-')}}</td><td><span class="pn">${{d.port}}</span></td><td><span class="b b-s">${{esc(d.service)}}</span></td>
-<td><span class="b b-o">OPEN</span></td><td class="bn">${{esc((d.banner||'').substring(0,80))||'No banner'}}</td>
+r.innerHTML=`<td class="pn" title="${{esc(d.target||'-')}}">${{esc(d.target||'-')}}</td>
+<td class="hn" title="${{esc(d.hostname||'')}}">${{esc(d.hostname||'—')}}</td>
+<td><span class="pn">${{d.port}}</span></td><td><span class="b b-s">${{esc(d.service)}}</span></td>
+<td><span class="b b-o">OPEN</span></td><td class="bn" title="${{esc(d.banner||'')}}">${{esc((d.banner||'').substring(0,120))||'No banner'}}</td>
 <td><span class="b ${{st}}">${{esc(d.scan_type)}}</span></td><td>${{lat}}</td><td>${{cb}}</td>`;
-tb.insertBefore(r,tb.firstChild);}}
+tb.insertBefore(r,tb.firstChild);
+var cur=document.getElementById('dfilter');
+if(cur&&cur.value){{var v=cur.value.toLowerCase();if(!r.textContent.toLowerCase().includes(v))r.style.display='none';}}
+}}
 else if(ev.type==='progress'){{document.getElementById('s-scn').textContent=ev.data.scanned+'/'+ev.data.total;}}
 else if(ev.type==='scan_complete'){{clearInterval(tmr);const s=document.getElementById('status');s.textContent='COMPLETE';
 s.classList.add('done');s.classList.remove('pulse');src.close();}}
-}};</script></body></html>'''
+}};
+var df=document.getElementById('dfilter');
+if(df){{df.addEventListener('input',function(e){{var v=e.target.value.toLowerCase();
+document.querySelectorAll('#tbody tr').forEach(function(r){{r.style.display=r.textContent.toLowerCase().includes(v)?'':'none';}});}});}}
+</script></body></html>'''
 
 
 # ── Scan Diff / Comparison ─────────────────────────────────────
@@ -1730,8 +1915,11 @@ def main():
                         help="UDP ports to scan (default: DNS, SNMP, NTP, DHCP, TFTP)")
     parser.add_argument("--no-banner", action="store_true",
                         help="Skip banner grabbing (faster)")
-    parser.add_argument("-o", "--output", default="scan_result",
-                        help="Output filename prefix (default: scan_result)")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Output filename prefix (default: canavar_<target>_<timestamp>)")
+    parser.add_argument("--output-dir", default=None, metavar="DIR",
+                        help="Directory to save output files (default: current working directory). "
+                             "Created automatically if it does not exist.")
     parser.add_argument("--lang", choices=["en", "tr"], default="tr",
                         help="Output language (default: tr)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1849,6 +2037,27 @@ def main():
         dashboard_state.metadata = {"target": args.target, "total_ports": len(ports) + (len(udp_ports) if udp_ports else 0)}
         dashboard_server = start_dashboard(args.dashboard_port, dashboard_state)
 
+    # Resolve output path: <dir>/<prefix>
+    def _sanitize_target(t):
+        """Make a target string safe for use in a filename."""
+        return re.sub(r'[^A-Za-z0-9._-]+', '_', t).strip('_') or "target"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.output:
+        output_prefix = args.output
+    else:
+        output_prefix = f"canavar_{_sanitize_target(args.target)}_{timestamp}"
+
+    if args.output_dir:
+        try:
+            os.makedirs(args.output_dir, exist_ok=True)
+        except OSError as e:
+            cprint(L["error"].format(msg=f"Cannot create output directory '{args.output_dir}': {e}"), C.RED)
+            sys.exit(1)
+        output_path = os.path.join(args.output_dir, output_prefix)
+    else:
+        output_path = output_prefix
+
     # Scan metadata
     start_time = time.time()
     start_dt = datetime.now()
@@ -1876,14 +2085,26 @@ def main():
     # Run scans
     try:
         for display_name, ip, is_ipv6 in targets:
-            cprint(f"\n{L['scanning_target'].format(target=display_name)} ({ip})", C.BOLD + C.BLUE)
+            # Reverse DNS lookup for hostname
+            hostname = reverse_dns_lookup(ip)
+            if hostname and hostname != ip:
+                header_line = f"\n{L['scanning_target'].format(target=display_name)} ({ip}) [{hostname}]"
+            else:
+                header_line = f"\n{L['scanning_target'].format(target=display_name)} ({ip})"
+            cprint(header_line, C.BOLD + C.BLUE)
+            if hostname:
+                cprint(f"[*] {L['hostname']}: {hostname}", C.CYAN)
+            else:
+                cprint(f"[*] {L['hostname_not_found']}", C.DIM)
             cprint(L["scan_started"].format(
                 target=ip, time=datetime.now().strftime("%H:%M:%S")
             ), C.YELLOW)
 
             if dashboard_state:
                 dashboard_state.add_event("scan_start", {
-                    "target": display_name, "ip": ip, "total_ports": len(ports) + (len(udp_ports) if udp_ports else 0)
+                    "target": display_name, "ip": ip,
+                    "hostname": hostname or "",
+                    "total_ports": len(ports) + (len(udp_ports) if udp_ports else 0)
                 })
 
             results = run_scan(
@@ -1899,10 +2120,11 @@ def main():
             if args.os_detect:
                 os_detection = os_fingerprint(ip, port=80, timeout=timeout, is_ipv6=is_ipv6)
                 if os_detection:
-                    cprint(f"[*] OS Detection: {os_detection}", C.CYAN)
+                    cprint(f"[*] {L['os_detected']}: {os_detection}", C.CYAN)
 
             scan_data["targets"].append({
                 "target": display_name, "ip": ip,
+                "hostname": hostname or "",
                 "results": results, "open_count": len(results),
                 "os_detection": os_detection or "Unknown",
             })
@@ -1932,11 +2154,11 @@ def main():
         print_vuln_results(vulns, lang_code)
 
     # Export results
-    export_json(scan_data, args.output)
-    export_csv(scan_data, args.output)
-    html_path = export_html(scan_data, args.output, lang_code)
+    export_json(scan_data, output_path)
+    export_csv(scan_data, output_path)
+    html_path = export_html(scan_data, output_path, lang_code)
 
-    files = f"{args.output}.json, {args.output}.csv, {args.output}.html"
+    files = f"{output_path}.json, {output_path}.csv, {output_path}.html"
     cprint(L["results_saved"].format(files=files), C.YELLOW)
 
     # Scan Diff
