@@ -13,6 +13,7 @@ import time
 import json
 import csv
 import os
+import io
 import sys
 import ssl
 import re
@@ -32,6 +33,10 @@ import logging
 
 # Configure logging
 logger = logging.getLogger("canavar")
+
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # ── Optional Dependencies ──────────────────────────────────────
 try:
