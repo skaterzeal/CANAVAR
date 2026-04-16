@@ -4,11 +4,29 @@
 
 **Platforms:** Windows · macOS · Kali Linux · Any Python 3.7+
 
+---
+
+## ⚠️ Legal Disclaimer — Read Before Use
+
+**Canavar is a network reconnaissance tool intended for authorized security testing, internal network audits, and educational use only.**
+
+- **Only scan systems you own or have explicit, written permission to test.** Scanning third-party systems without authorization is illegal in most jurisdictions (e.g., Computer Fraud and Abuse Act in the US, Computer Misuse Act in the UK, TCK 243/244 in Türkiye, and equivalent laws elsewhere) and may carry criminal and civil penalties.
+- The vulnerability database is **indicative, not exhaustive** — it provides hints based on banner matching and a curated CVE list, and should not be treated as a substitute for a professional vulnerability assessment. Always verify findings against authoritative sources such as [NVD](https://nvd.nist.gov/) and the vendor's advisories.
+- The author(s) and contributors of this project assume **no liability** for misuse, damage, or legal consequences arising from the use of this tool. By using Canavar, you accept full responsibility for your actions.
+- For lawful testing targets, see [scanme.nmap.org](http://scanme.nmap.org) (explicitly allowed) or set up your own lab environment.
+
+**If you are unsure whether you have authorization to scan a target, do not scan it.**
+
+---
+
 ## Quick Start
 
 ```bash
 # No installation needed! Just run:
 python canavar.py -t 192.168.1.1 --top-ports 100
+
+# Auto-scan your local network (no target needed!)
+python canavar.py --auto --top-ports 100
 
 # With live dashboard:
 python canavar.py -t 10.0.0.0/24 --top-ports 50 --dashboard
@@ -26,6 +44,7 @@ pip install tqdm colorama
 ## Features
 
 ### Core Scanning
+- **Auto Local Network Scan** (`--auto`) – No target needed! Automatically detects your local subnet (default /24) and scans it. Host discovery is enabled automatically for fast results
 - **TCP Connect Scan** – No root/admin required
 - **SYN Stealth Scan** – Half-open scan (requires root + scapy)
 - **UDP Scan** – Protocol-aware probes for DNS, SNMP, NTP, DHCP, TFTP
@@ -35,10 +54,11 @@ pip install tqdm colorama
 - **Top Ports** – Scan most commonly open ports (`--top-ports 100`)
 
 ### Intelligence
+- **CDN / Reverse Proxy Detection** – Automatically identifies when a target sits behind Cloudflare, Fastly, Akamai, CloudFront, Imperva, Sucuri, Azure Front Door, StackPath, EdgeCast, or CDN77. Uses a layered classifier (IP range membership + HTTP header fingerprints + port-set heuristic) with confidence scoring. CDN-hosted ports are clearly flagged in terminal, HTML, JSON, and CSV — with optional `--filter-cdn` to suppress CDN edge noise from the main report
 - **Banner Grabbing** – Protocol-aware: HTTP, HTTPS, SSH, FTP, SMTP, POP3, IMAP, MySQL, Redis, MongoDB, Memcached, Elasticsearch, Telnet
-- **CVE Suggestions** – Hardcoded real-world CVE matching based on banners
-- **NVD CVE Update** (`--update-cve`) – Optionally fetch latest CVEs from NVD API. Results are cached locally for 24 hours. Works fully offline with hardcoded CVEs when not used
-- **Vulnerability Assessment** (`--vuln-scan`) – Version-aware vulnerability detection with CVSS scores and severity levels
+- **CVE Suggestions** – Indicative CVE hints from a curated banner→CVE map. Not a substitute for a full vuln scanner; always verify against [NVD](https://nvd.nist.gov/)
+- **NVD CVE Update** (`--update-cve`) – Optionally fetch latest CVEs from NVD API across ~24 keywords. Results cached locally for 24h and **persisted across runs** (subsequent scans automatically use cached data without re-fetching). Works fully offline with hardcoded CVEs when not used
+- **Vulnerability Assessment** (`--vuln-scan`) – Version-aware checks against a small curated DB with CVSS scores and severity levels. Output is *indicative only* — confirm before remediation
 - **OS Detection** (`--os-detect`) – TTL-based operating system fingerprinting (Linux/macOS/Windows/Network Device)
 - **SSL/TLS Certificate Analysis** – Automatic certificate inspection on HTTPS ports: CN, Issuer, SAN, expiry date, days remaining
 
@@ -82,6 +102,32 @@ pip install Pillow
 ```
 
 ## Usage
+
+### Auto Local Network Scan
+
+Scan your own local network without specifying a target. Canavar detects your machine's primary IP, derives the subnet (default /24), and scans every host on it:
+
+```bash
+# Auto-scan local /24 network with top 100 ports
+python canavar.py --auto --top-ports 100
+
+# Auto-scan with vulnerability assessment + OS detection
+python canavar.py --auto --top-ports 100 --vuln-scan --os-detect
+
+# Auto-scan a /16 network (larger scope)
+python canavar.py --auto --auto-prefix 16 --top-ports 50
+
+# Auto-scan with live dashboard
+python canavar.py --auto --top-ports 100 --dashboard --lang en
+```
+
+How it works:
+1. Opens a UDP socket toward `8.8.8.8` (no packet leaves the host — just triggers OS routing decision) to discover this machine's outbound IP.
+2. Falls back to hostname resolution if the UDP trick fails.
+3. Constructs a CIDR subnet (`<your-ip>/<prefix>`) and enables `--discovery` automatically so only alive hosts are scanned.
+4. Refuses to proceed if only the loopback interface is available.
+
+> **⚠️ LEGAL NOTE:** `--auto` makes it trivially easy to scan the network you are connected to. **Only use this on networks you own or have explicit permission to test** (your home network, your lab, your employer's network with written authorization). Scanning a public Wi-Fi, hotel, or café network is almost certainly a legal violation. See the [Legal Disclaimer](#️-legal-disclaimer--read-before-use) above.
 
 ### Basic Scanning
 
@@ -300,6 +346,40 @@ Features:
 - Direct links to NVD for each CVE
 - Results included in JSON/CSV/HTML exports
 
+### CDN / Reverse Proxy Detection
+
+When a target sits behind a CDN or reverse proxy (Cloudflare, Fastly, Akamai, CloudFront, Imperva, Sucuri, Azure Front Door, StackPath, EdgeCast, CDN77), the "open ports" you observe belong to the **CDN edge**, not the real origin server. Cloudflare alone responds on a fixed set of 13 ports for every hostname behind it — scanning a Cloudflare-protected site without awareness produces noisy, misleading reports where every target looks identical.
+
+Canavar detects this automatically using three independent signals:
+
+1. **IP range membership** — Every major CDN publishes its IP ranges. Canavar ships with a curated snapshot of ~400 CIDR blocks (Cloudflare, Fastly, Akamai, CloudFront, Imperva, Sucuri, Azure Front Door, StackPath) and can refresh them on demand from authoritative sources (`cloudflare.com/ips-v4`, Fastly public-ip-list API, AWS `ip-ranges.json`).
+2. **HTTP header fingerprints** — 25+ regex signatures covering vendor-specific headers: `CF-RAY`, `CF-Cache-Status`, `X-Served-By: cache-*`, `X-Fastly-Request-ID`, `Server: AkamaiGHost`, `X-Amz-Cf-Id`, `X-Iinfo`, `X-Sucuri-ID`, `X-Azure-Ref`, and more. Run against already-grabbed banners — no extra requests.
+3. **Edge-port heuristic** — When a target exposes the exact CDN-typical port set (80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880) without other signals, it's flagged as "Unknown CDN" at low confidence.
+
+Findings carry a confidence level:
+- **high** — both IP range and header signature match
+- **medium** — one layer matches
+- **low** — only the port-set heuristic matched
+
+```bash
+# Default: CDN-hosted ports are tagged but kept in the report
+python canavar.py -t example.com --top-ports 100
+
+# Filter: move CDN edge ports into a separate "cdn_filtered_ports" block in JSON
+python canavar.py -t example.com --top-ports 100 --filter-cdn
+
+# Refresh ranges from Cloudflare / Fastly / AWS (cached 7 days)
+python canavar.py -t example.com --top-ports 100 --update-cdn-ranges
+```
+
+Output integration:
+- **Terminal:** yellow `[!] CDN/Proxy detected: Cloudflare (confidence: high)` warning with up to 3 evidence lines
+- **HTML:** dedicated "⚠ CDN / Reverse Proxy Detected" advisory card with per-target evidence; CDN column in the target table; `via <Provider>` badge on each affected port row
+- **JSON:** `cdn_info` object per target (`is_cdn`, `provider`, `confidence`, `evidence`, `edge_ports_seen`); `via_cdn` and `cdn_provider` fields per port; when `--filter-cdn` is active, suppressed ports are preserved under `cdn_filtered_ports` (nothing is silently discarded)
+- **CSV:** three additional columns: `CDN Provider`, `Via CDN`, `CDN Confidence`
+
+> **To audit the real origin behind a CDN** you need to find the origin IP by other means — historical DNS (SecurityTrails, ViewDNS), certificate transparency logs (crt.sh), SPF record leaks, or direct vendor access. Canavar surfaces the problem; finding origins is out of scope.
+
 ### Scan Diff / Comparison
 
 Compare two scans to detect changes over time:
@@ -338,7 +418,9 @@ python canavar.py -t 192.168.1.0/24 \
 
 | Argument | Description | Default |
 |---|---|---|
-| `-t, --target` | Target IP, hostname, IPv6, or CIDR | *required* |
+| `-t, --target` | Target IP, hostname, IPv6, or CIDR | required unless `--auto` |
+| `--auto` | Auto-detect local network and scan it (mutually exclusive with `-t`) | `false` |
+| `--auto-prefix N` | CIDR prefix length used by `--auto` | `24` |
 | `-p, --ports` | Port specification | `1-1024` |
 | `--top-ports N` | Scan top N common ports | - |
 | `-th, --threads` | Thread count (overridden by timing profile) | `200` |
@@ -358,6 +440,8 @@ python canavar.py -t 192.168.1.0/24 \
 | `--os-detect` | Enable TTL-based OS detection | `false` |
 | `--update-cve` | Update CVE database from NVD API | `false` |
 | `--nvd-api-key` | NVD API key for higher rate limits | - |
+| `--filter-cdn` | Suppress CDN/proxy edge ports from main report (kept in JSON for audit) | `false` |
+| `--update-cdn-ranges` | Refresh CDN IP ranges from CF/Fastly/AWS (cached 7 days) | `false` |
 | `--dashboard` | Launch live web dashboard | `false` |
 | `--dashboard-port` | Dashboard port | `8888` |
 | `--diff FILE` | Compare with previous scan JSON | - |

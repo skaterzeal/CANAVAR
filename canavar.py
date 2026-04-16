@@ -475,7 +475,8 @@ def grab_banner(target, port, timeout=2, is_ipv6=False):
 
             banner = s.recv(1024).decode(errors="ignore").strip()
             return banner[:300] if banner else ""
-    except Exception:
+    except Exception as e:
+        logger.debug("Banner grab failed for %s:%d: %s", target, port, e)
         return ""
 
 
@@ -593,21 +594,26 @@ def _get_cve_cache_path():
     return os.path.join(_get_script_dir(), "cve_cache.json")
 
 
-def load_cve_cache():
-    """Load CVE cache from file if valid."""
+def load_cve_cache(max_age_hours=24):
+    """Load CVE cache from file if it exists and is fresh.
+    Returns (cves_dict, is_fresh) where is_fresh=True if within max_age_hours.
+    Returns (None, False) if no cache exists or cache is unreadable."""
     cache_file = _get_cve_cache_path()
+    if not os.path.exists(cache_file):
+        return None, False
     try:
-        if os.path.exists(cache_file):
-            with open(cache_file, "r") as f:
-                cache = json.load(f)
-                timestamp = cache.get("timestamp")
-                if timestamp:
-                    cache_time = datetime.fromisoformat(timestamp)
-                    if datetime.now() - cache_time < timedelta(hours=24):
-                        return cache.get("cves", {})
-    except Exception:
-        pass
-    return None
+        with open(cache_file, "r") as f:
+            cache = json.load(f)
+        timestamp = cache.get("timestamp")
+        cves = cache.get("cves", {})
+        if not timestamp or not cves:
+            return None, False
+        cache_time = datetime.fromisoformat(timestamp)
+        is_fresh = (datetime.now() - cache_time) < timedelta(hours=max_age_hours)
+        return cves, is_fresh
+    except Exception as e:
+        logger.debug("CVE cache load failed: %s", e)
+        return None, False
 
 
 def save_cve_cache(cves):
@@ -617,53 +623,484 @@ def save_cve_cache(cves):
         cache = {"timestamp": datetime.now().isoformat(), "cves": cves}
         with open(cache_file, "w") as f:
             json.dump(cache, f)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("CVE cache save failed: %s", e)
 
 
-def update_cve_database(api_key=None, lang_code="en"):
-    """Fetch CVEs from NVD REST API and merge with hardcoded database."""
+def get_effective_cve_database():
+    """Return the CVE database to use for this scan.
+    Merges hardcoded CVE_DATABASE with any cached NVD data (even if stale).
+    This allows previous --update-cve runs to persist across subsequent scans."""
+    cached, _ = load_cve_cache(max_age_hours=24 * 365)  # use cache if any age
+    if not cached:
+        return CVE_DATABASE
+    merged = dict(CVE_DATABASE)
+    for key, vals in cached.items():
+        if key not in merged:
+            merged[key] = []
+        existing_ids = {cve_id for cve_id, _ in merged[key]}
+        for entry in vals:
+            # Cached entries may be tuples or lists (JSON round-trip)
+            if len(entry) >= 2 and entry[0] not in existing_ids:
+                merged[key].append((entry[0], entry[1]))
+                existing_ids.add(entry[0])
+    return merged
+
+
+# Expanded keyword list for NVD fetching
+NVD_KEYWORDS = [
+    "apache", "nginx", "openssh", "mysql", "mariadb", "postgresql",
+    "redis", "mongodb", "elasticsearch", "memcached", "vsftpd", "proftpd",
+    "pure-ftpd", "samba", "postfix", "exim", "sendmail", "dovecot",
+    "microsoft-iis", "tomcat", "jetty", "lighttpd", "haproxy", "rabbitmq",
+]
+
+
+def update_cve_database(api_key=None, lang_code="en", verbose=False):
+    """Fetch CVEs from NVD REST API and merge with hardcoded database.
+    Uses fresh cache (<24h) if available. Otherwise queries NVD for each keyword,
+    merges results with hardcoded DB, and persists to cache."""
     L = LANG[lang_code]
     cprint(L["updating_cve"], C.CYAN)
 
-    # Check cache first
-    cached = load_cve_cache()
-    if cached:
-        return cached
+    # Use fresh cache (<24h) to avoid hammering NVD
+    cached, is_fresh = load_cve_cache(max_age_hours=24)
+    if cached and is_fresh:
+        if verbose:
+            cprint(f"[*] Using cached NVD CVE data ({len(cached)} keywords)", C.CYAN)
+        # Still merge with hardcoded in case CVE_DATABASE got new additions
+        merged = dict(CVE_DATABASE)
+        for k, v in cached.items():
+            merged.setdefault(k, [])
+            ids = {c for c, _ in merged[k]}
+            for entry in v:
+                if len(entry) >= 2 and entry[0] not in ids:
+                    merged[k].append((entry[0], entry[1]))
+        return merged
 
     merged_cves = dict(CVE_DATABASE)
+    results_per_page = 20
+    fetched = 0
+    errors = 0
 
-    keywords = [
-        "apache", "nginx", "openssh", "mysql", "postgresql", "redis",
-        "mongodb", "elasticsearch", "vsftpd", "samba", "postfix"
-    ]
+    # Retry wrapper with exponential backoff for rate limit resilience
+    def _fetch(url, attempts=3):
+        last_err = None
+        for i in range(attempts):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Canavar-Scanner/2026"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    return json.loads(response.read().decode())
+            except Exception as e:
+                last_err = e
+                time.sleep(2 ** i)  # 1s, 2s, 4s
+        raise last_err
 
-    for keyword in keywords:
+    for keyword in NVD_KEYWORDS:
         try:
-            url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={keyword}&resultsPerPage=5"
+            url = (
+                f"https://services.nvd.nist.gov/rest/json/cves/2.0"
+                f"?keywordSearch={keyword}&resultsPerPage={results_per_page}"
+            )
             if api_key:
                 url += f"&apiKey={api_key}"
 
-            req = urllib.request.Request(url, headers={"User-Agent": "Canavar-Scanner/2026"})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode())
+            data = _fetch(url)
 
-                if "vulnerabilities" in data:
-                    for vuln in data["vulnerabilities"][:5]:
-                        cve_id = vuln.get("cve", {}).get("id", "")
-                        desc = vuln.get("cve", {}).get("descriptions", [{}])[0].get("value", "")
-                        if cve_id:
-                            if keyword not in merged_cves:
-                                merged_cves[keyword] = []
-                            merged_cves[keyword].append((cve_id, desc[:100]))
+            if "vulnerabilities" in data:
+                merged_cves.setdefault(keyword, [])
+                existing_ids = {cve_id for cve_id, _ in merged_cves[keyword]}
+                for vuln in data["vulnerabilities"][:results_per_page]:
+                    cve_id = vuln.get("cve", {}).get("id", "")
+                    descs = vuln.get("cve", {}).get("descriptions", [{}])
+                    desc = descs[0].get("value", "") if descs else ""
+                    if cve_id and cve_id not in existing_ids:
+                        merged_cves[keyword].append((cve_id, desc[:140]))
+                        existing_ids.add(cve_id)
+                        fetched += 1
 
-            time.sleep(0.5)  # Rate limiting
-        except Exception:
+            # Rate limiting: 6s for unauthenticated (5 req / 30s), 0.6s with key (50 req / 30s)
+            time.sleep(0.6 if api_key else 6.0)
+        except Exception as e:
+            errors += 1
+            logger.debug("NVD fetch failed for '%s': %s", keyword, e)
             continue
 
     save_cve_cache(merged_cves)
+    if verbose or errors:
+        cprint(f"[*] NVD fetch: {fetched} new CVEs across {len(NVD_KEYWORDS)} keywords ({errors} errors)", C.CYAN)
     cprint(L["cve_updated"], C.GREEN)
     return merged_cves
+
+# ── CDN / Reverse Proxy Detection ─────────────────────────────
+# Detecting when a target sits behind a CDN/WAF (Cloudflare, Fastly, Akamai,
+# CloudFront, Imperva, Sucuri, etc.) is critical: the "open ports" we observe
+# belong to the CDN edge, not the real origin. Without this flag, scans of
+# CF-protected hosts produce noisy, misleading reports.
+#
+# Detection is layered (any match → flagged):
+#   1. IP range membership — provider-published CIDR lists (offline-capable via
+#      baked-in snapshot; refreshable via --update-cdn-ranges).
+#   2. HTTP response fingerprints — CDN-specific headers in grabbed banners
+#      (Server: cloudflare, CF-RAY, X-Amz-Cf-Id, X-Iinfo, etc.).
+#   3. TLS certificate issuer hints (Cloudflare Inc ECC CA, Amazon, etc.).
+#
+# Snapshot current as of 2026-04 — authoritative sources are fetched on demand.
+
+CDN_STATIC_RANGES = {
+    "Cloudflare": {
+        "v4": [
+            "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+            "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+            "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+            "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+            "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+        ],
+        "v6": [
+            "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+            "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+            "2c0f:f248::/32",
+        ],
+        "fetch_v4": "https://www.cloudflare.com/ips-v4",
+        "fetch_v6": "https://www.cloudflare.com/ips-v6",
+    },
+    "Fastly": {
+        "v4": [
+            "23.235.32.0/20", "43.249.72.0/22", "103.244.50.0/24",
+            "103.245.222.0/23", "103.245.224.0/24", "104.156.80.0/20",
+            "140.248.64.0/18", "140.248.128.0/17", "146.75.0.0/17",
+            "151.101.0.0/16", "157.52.64.0/18", "167.82.0.0/17",
+            "167.82.128.0/20", "167.82.160.0/20", "167.82.224.0/20",
+            "172.111.64.0/18", "185.31.16.0/22", "199.27.72.0/21",
+            "199.232.0.0/16",
+        ],
+        "v6": ["2a04:4e40::/32", "2a04:4e42::/32"],
+        "fetch_json": "https://api.fastly.com/public-ip-list",
+    },
+    "Akamai": {
+        # Akamai uses thousands of ranges; partial set + header detection covers most
+        "v4": [
+            "23.32.0.0/11", "23.192.0.0/11", "23.64.0.0/14",
+            "23.72.0.0/13", "72.246.0.0/15", "88.221.0.0/16",
+            "92.122.0.0/15", "95.100.0.0/15", "96.6.0.0/15",
+            "96.16.0.0/15", "104.64.0.0/10", "184.24.0.0/13",
+        ],
+        "v6": ["2600:1400::/24", "2a02:26f0::/32"],
+    },
+    "CloudFront": {
+        # AWS publishes via ip-ranges.json — filter service=CLOUDFRONT
+        "v4": [
+            "13.32.0.0/15", "13.35.0.0/16", "13.224.0.0/14",
+            "18.64.0.0/14", "18.160.0.0/15", "18.172.0.0/15",
+            "18.238.0.0/15", "18.244.0.0/15", "52.46.0.0/18",
+            "52.82.128.0/19", "52.84.0.0/15", "52.124.128.0/17",
+            "52.222.128.0/17", "54.182.0.0/16", "54.192.0.0/16",
+            "54.230.0.0/16", "54.239.128.0/18", "54.240.128.0/18",
+            "64.252.64.0/18", "70.132.0.0/18", "71.152.0.0/17",
+            "99.84.0.0/16", "99.86.0.0/16", "108.138.0.0/15",
+            "108.156.0.0/14", "130.176.0.0/16", "143.204.0.0/16",
+            "204.246.164.0/22", "204.246.168.0/22", "204.246.172.0/23",
+            "204.246.174.0/23", "204.246.176.0/20", "205.251.192.0/19",
+            "205.251.249.0/24", "205.251.250.0/23", "205.251.252.0/23",
+            "205.251.254.0/24", "216.137.32.0/19",
+        ],
+        "v6": ["2600:9000::/28"],
+        "fetch_json": "https://ip-ranges.amazonaws.com/ip-ranges.json",
+    },
+    "Imperva": {
+        "v4": [
+            "199.83.128.0/21", "198.143.32.0/19", "149.126.72.0/21",
+            "103.28.248.0/22", "185.11.124.0/22", "192.230.64.0/18",
+            "45.64.64.0/22", "107.154.0.0/16", "45.60.0.0/16",
+            "45.223.0.0/16", "131.125.128.0/17",
+        ],
+        "v6": ["2a02:e980::/29"],
+    },
+    "Sucuri": {
+        "v4": [
+            "192.88.134.0/23", "185.93.228.0/22", "66.248.200.0/22",
+            "208.109.0.0/22",
+        ],
+        "v6": [],
+    },
+    "Azure Front Door": {
+        "v4": [
+            "13.73.248.0/22", "20.36.120.0/22", "20.37.64.0/22",
+            "20.37.156.0/22", "20.38.84.0/22", "20.38.136.0/22",
+            "20.39.11.0/24", "20.41.4.0/22", "20.41.64.0/22",
+            "20.41.192.0/22", "20.42.4.0/22", "20.42.128.0/22",
+            "20.43.40.0/22", "20.43.64.0/22", "20.43.128.0/22",
+            "20.43.192.0/22", "20.44.8.0/22", "20.45.116.0/22",
+            "20.45.192.0/22", "20.189.104.0/22",
+        ],
+        "v6": ["2603:1030::/25"],
+    },
+    "StackPath / MaxCDN": {
+        "v4": [
+            "69.162.64.0/19", "94.46.144.0/21", "151.139.0.0/19",
+            "151.139.128.0/19", "151.139.192.0/19", "151.139.224.0/19",
+            "205.185.192.0/19", "205.185.208.0/20",
+        ],
+        "v6": [],
+    },
+}
+
+# Header/banner fingerprints — checked against grabbed HTTP response text.
+# These are highest-confidence signals (CDN vendor headers are rarely spoofed).
+CDN_HEADER_SIGNATURES = [
+    (re.compile(r"^\s*server\s*:\s*cloudflare", re.I | re.M), "Cloudflare", "header"),
+    (re.compile(r"^\s*cf-ray\s*:", re.I | re.M), "Cloudflare", "cf-ray"),
+    (re.compile(r"^\s*cf-cache-status\s*:", re.I | re.M), "Cloudflare", "cf-cache"),
+    (re.compile(r"^\s*cf-connecting-ip\s*:", re.I | re.M), "Cloudflare", "cf-ip"),
+    (re.compile(r"^\s*server\s*:\s*AkamaiGHost", re.I | re.M), "Akamai", "header"),
+    (re.compile(r"^\s*server\s*:\s*AkamaiNetStorage", re.I | re.M), "Akamai", "netstorage"),
+    (re.compile(r"^\s*x-akamai-", re.I | re.M), "Akamai", "x-akamai"),
+    (re.compile(r"^\s*x-served-by\s*:.*cache-", re.I | re.M), "Fastly", "x-served-by"),
+    (re.compile(r"^\s*x-fastly-request-id\s*:", re.I | re.M), "Fastly", "x-fastly-id"),
+    (re.compile(r"^\s*fastly-debug-digest\s*:", re.I | re.M), "Fastly", "fastly-debug"),
+    (re.compile(r"^\s*x-amz-cf-id\s*:", re.I | re.M), "CloudFront", "x-amz-cf-id"),
+    (re.compile(r"^\s*x-amz-cf-pop\s*:", re.I | re.M), "CloudFront", "x-amz-cf-pop"),
+    (re.compile(r"^\s*via\s*:.*cloudfront", re.I | re.M), "CloudFront", "via"),
+    (re.compile(r"^\s*x-iinfo\s*:", re.I | re.M), "Imperva", "x-iinfo"),
+    (re.compile(r"^\s*x-cdn\s*:\s*imperva", re.I | re.M), "Imperva", "x-cdn"),
+    (re.compile(r"^\s*server\s*:\s*imperva", re.I | re.M), "Imperva", "header"),
+    (re.compile(r"^\s*x-sucuri-id\s*:", re.I | re.M), "Sucuri", "x-sucuri-id"),
+    (re.compile(r"^\s*x-sucuri-cache\s*:", re.I | re.M), "Sucuri", "x-sucuri-cache"),
+    (re.compile(r"^\s*server\s*:\s*sucuri", re.I | re.M), "Sucuri", "header"),
+    (re.compile(r"^\s*x-azure-ref\s*:", re.I | re.M), "Azure Front Door", "x-azure-ref"),
+    (re.compile(r"^\s*x-msedge-ref\s*:", re.I | re.M), "Azure Front Door", "x-msedge-ref"),
+    (re.compile(r"^\s*server\s*:\s*ECS\b", re.I | re.M), "EdgeCast", "header"),
+    (re.compile(r"^\s*server\s*:\s*ECAcc", re.I | re.M), "EdgeCast", "header"),
+    (re.compile(r"^\s*server\s*:\s*cdn77", re.I | re.M), "CDN77", "header"),
+    (re.compile(r"^\s*x-cdn\s*:\s*stackpath", re.I | re.M), "StackPath / MaxCDN", "x-cdn"),
+]
+
+# Common CDN edge ports — used as a weak corroborating signal. Not a primary
+# indicator on its own, but when a target opens this exact set it's highly
+# suggestive of a shared-edge proxy.
+CDN_EDGE_PORT_SET = frozenset([80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880])
+
+
+def _get_cdn_cache_path():
+    return os.path.join(_get_script_dir(), "cdn_ranges_cache.json")
+
+
+def _compile_ranges(raw):
+    """Parse a dict of {provider: {v4:[...], v6:[...]}} into compiled ip_network list."""
+    compiled = {}
+    for provider, data in raw.items():
+        nets = []
+        for cidr in data.get("v4", []) + data.get("v6", []):
+            try:
+                nets.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError as e:
+                logger.debug("Bad CIDR %s for %s: %s", cidr, provider, e)
+        if nets:
+            compiled[provider] = nets
+    return compiled
+
+
+_cdn_ranges_compiled = None
+
+
+def get_cdn_ranges():
+    """Return compiled {provider: [ip_network, ...]} from cache or static snapshot."""
+    global _cdn_ranges_compiled
+    if _cdn_ranges_compiled is not None:
+        return _cdn_ranges_compiled
+    cache_file = _get_cdn_cache_path()
+    raw = None
+    # Try fresh cache first
+    try:
+        if os.path.exists(cache_file):
+            with open(cache_file, "r") as f:
+                cache = json.load(f)
+            ts = cache.get("timestamp")
+            if ts:
+                age = datetime.now() - datetime.fromisoformat(ts)
+                if age < timedelta(days=7):
+                    raw = cache.get("providers", {})
+    except Exception as e:
+        logger.debug("CDN cache read failed: %s", e)
+    # Fall back to baked-in snapshot
+    if not raw:
+        raw = {p: {"v4": d.get("v4", []), "v6": d.get("v6", [])}
+               for p, d in CDN_STATIC_RANGES.items()}
+    _cdn_ranges_compiled = _compile_ranges(raw)
+    return _cdn_ranges_compiled
+
+
+def update_cdn_ranges(lang_code="en"):
+    """Fetch fresh IP ranges from each provider's authoritative source.
+    Falls back to the baked-in snapshot for any provider whose fetch fails.
+    Cache TTL: 7 days. This is critical for long-term accuracy — CF and
+    AWS update their ranges monthly."""
+    cprint("[*] Updating CDN IP ranges from authoritative sources...", C.CYAN)
+    fresh = {p: {"v4": list(d.get("v4", [])), "v6": list(d.get("v6", []))}
+             for p, d in CDN_STATIC_RANGES.items()}
+
+    def _fetch_text(url, timeout=10):
+        req = urllib.request.Request(url, headers={"User-Agent": "Canavar-Scanner/2026"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode()
+
+    # Cloudflare — plain text, one CIDR per line
+    try:
+        fresh["Cloudflare"]["v4"] = [l.strip() for l in _fetch_text(
+            CDN_STATIC_RANGES["Cloudflare"]["fetch_v4"]).splitlines() if l.strip()]
+        fresh["Cloudflare"]["v6"] = [l.strip() for l in _fetch_text(
+            CDN_STATIC_RANGES["Cloudflare"]["fetch_v6"]).splitlines() if l.strip()]
+        cprint(f"    ✓ Cloudflare: {len(fresh['Cloudflare']['v4'])} v4 + {len(fresh['Cloudflare']['v6'])} v6", C.GREEN)
+    except Exception as e:
+        cprint(f"    ✗ Cloudflare fetch failed ({e}) — using snapshot", C.YELLOW)
+
+    # Fastly — JSON with addresses/ipv6_addresses arrays
+    try:
+        data = json.loads(_fetch_text(CDN_STATIC_RANGES["Fastly"]["fetch_json"]))
+        fresh["Fastly"]["v4"] = data.get("addresses", [])
+        fresh["Fastly"]["v6"] = data.get("ipv6_addresses", [])
+        cprint(f"    ✓ Fastly: {len(fresh['Fastly']['v4'])} v4 + {len(fresh['Fastly']['v6'])} v6", C.GREEN)
+    except Exception as e:
+        cprint(f"    ✗ Fastly fetch failed ({e}) — using snapshot", C.YELLOW)
+
+    # CloudFront — AWS ip-ranges.json, filter on service=CLOUDFRONT
+    try:
+        data = json.loads(_fetch_text(CDN_STATIC_RANGES["CloudFront"]["fetch_json"]))
+        fresh["CloudFront"]["v4"] = [p["ip_prefix"] for p in data.get("prefixes", [])
+                                     if p.get("service") == "CLOUDFRONT"]
+        fresh["CloudFront"]["v6"] = [p["ipv6_prefix"] for p in data.get("ipv6_prefixes", [])
+                                     if p.get("service") == "CLOUDFRONT"]
+        cprint(f"    ✓ CloudFront: {len(fresh['CloudFront']['v4'])} v4 + {len(fresh['CloudFront']['v6'])} v6", C.GREEN)
+    except Exception as e:
+        cprint(f"    ✗ CloudFront fetch failed ({e}) — using snapshot", C.YELLOW)
+
+    # Persist
+    try:
+        with open(_get_cdn_cache_path(), "w") as f:
+            json.dump({"timestamp": datetime.now().isoformat(), "providers": fresh}, f)
+        cprint("[*] CDN ranges cached (valid 7 days)", C.GREEN)
+    except Exception as e:
+        logger.debug("CDN cache save failed: %s", e)
+
+    # Invalidate in-memory compile so next call reloads
+    global _cdn_ranges_compiled
+    _cdn_ranges_compiled = None
+
+
+def classify_ip_cdn(ip):
+    """Return CDN provider name if the IP belongs to any known CDN range, else None."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    ranges = get_cdn_ranges()
+    for provider, nets in ranges.items():
+        for net in nets:
+            if addr.version == net.version and addr in net:
+                return provider
+    return None
+
+
+def classify_banner_cdn(banner_text):
+    """Return (provider, signature_name) if banner matches a CDN fingerprint, else (None, None)."""
+    if not banner_text:
+        return None, None
+    for pattern, provider, sig_name in CDN_HEADER_SIGNATURES:
+        if pattern.search(banner_text):
+            return provider, sig_name
+    return None, None
+
+
+def detect_cdn_for_target(ip, port_results):
+    """Aggregate CDN detection for a target given its IP and per-port results.
+    Returns dict: {is_cdn, provider, confidence, evidence, edge_ports_seen}.
+    Combines: IP-range match, banner fingerprints, port-set heuristic."""
+    evidence = []
+    providers_found = []
+
+    # Layer 1: IP range
+    ip_provider = classify_ip_cdn(ip)
+    if ip_provider:
+        providers_found.append(ip_provider)
+        evidence.append(f"IP {ip} belongs to {ip_provider} published range")
+
+    # Layer 2: Banner fingerprints (highest confidence)
+    for r in port_results:
+        banner = r.get("banner", "")
+        if not banner:
+            continue
+        provider, sig = classify_banner_cdn(banner)
+        if provider:
+            providers_found.append(provider)
+            evidence.append(f"Port {r.get('port')}: header signature '{sig}' → {provider}")
+
+    # Layer 3: Port-set heuristic (weak signal — only flags when no other evidence)
+    open_ports = {r.get("port") for r in port_results if r.get("state") == "open"}
+    edge_overlap = open_ports & CDN_EDGE_PORT_SET
+    if len(edge_overlap) >= 5 and not providers_found:
+        evidence.append(f"Port-set heuristic: {len(edge_overlap)} CDN-typical edge ports open ({sorted(edge_overlap)})")
+        providers_found.append("Unknown CDN")
+
+    if not providers_found:
+        return {"is_cdn": False, "provider": None, "confidence": "none",
+                "evidence": [], "edge_ports_seen": sorted(edge_overlap)}
+
+    # Confidence scoring
+    layers_hit = sum([bool(ip_provider), any("header signature" in e for e in evidence)])
+    confidence = "high" if layers_hit >= 2 else ("medium" if layers_hit == 1 else "low")
+
+    # Pick the most-cited provider
+    from collections import Counter
+    provider = Counter(providers_found).most_common(1)[0][0]
+
+    return {
+        "is_cdn": True,
+        "provider": provider,
+        "confidence": confidence,
+        "evidence": evidence,
+        "edge_ports_seen": sorted(edge_overlap),
+    }
+
+
+# ── Local Network Auto-Detection ──────────────────────────────
+def get_local_ip():
+    """Return this machine's primary outbound IPv4 address.
+    Uses a UDP socket trick: connecting to a public IP (no packet is sent)
+    makes the OS pick the default-route interface, whose local address we
+    read via getsockname(). Works on Windows, macOS, and Linux without root."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # 8.8.8.8:80 is never actually contacted with SOCK_DGRAM+connect; it
+        # only populates the kernel routing choice. No packets leave the host.
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception as e:
+        logger.debug("Primary IP detection via UDP trick failed: %s", e)
+        # Fallback: hostname resolution (often returns 127.0.1.1 on Linux)
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except Exception as e2:
+            logger.debug("Hostname-based IP detection failed: %s", e2)
+            ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+def detect_local_network(prefix=24):
+    """Detect the local subnet as a CIDR string (e.g. '192.168.1.0/24').
+    Defaults to /24 which covers the vast majority of home/office LANs.
+    Returns None for loopback (127.x) addresses."""
+    ip = get_local_ip()
+    if ip.startswith("127.") or ip == "0.0.0.0":
+        return None, ip
+    try:
+        net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+        return str(net), ip
+    except ValueError as e:
+        logger.debug("CIDR construction failed for %s/%d: %s", ip, prefix, e)
+        return None, ip
+
 
 # ── Target Resolution ─────────────────────────────────────────
 def resolve_targets(target_str):
@@ -736,8 +1173,8 @@ def ping_host_tcp(target, timeout=2, is_ipv6=False):
                 s.settimeout(timeout)
                 if s.connect_ex((target, port)) == 0:
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("TCP discovery probe %s:%d failed: %s", target, port, e)
     return False
 
 
@@ -750,7 +1187,8 @@ def ping_host_icmp(target, timeout=1):
             cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), target]
         result = subprocess.run(cmd, capture_output=True, timeout=timeout + 1)
         return result.returncode == 0
-    except Exception:
+    except Exception as e:
+        logger.debug("ICMP ping failed for %s: %s", target, e)
         return False
 
 
@@ -808,8 +1246,8 @@ def os_fingerprint(target, port=80, timeout=2, is_ipv6=False):
                 return "Windows"
             elif "freebsd" in banner:
                 return "FreeBSD"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("OS fingerprint banner read failed for %s:%d: %s", target, port, e)
     return None
 
 
@@ -826,8 +1264,8 @@ def _get_ping_ttl(target, timeout=2):
             match = re.search(r'ttl[=:]\s*(\d+)', result.stdout, re.IGNORECASE)
             if match:
                 return int(match.group(1))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Ping TTL parse failed for %s: %s", target, e)
     return None
 
 # ── Port Scanning ─────────────────────────────────────────────
@@ -1097,12 +1535,16 @@ def export_csv(scan_data, filename):
     with open(f"{filename}.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Target", "IP", "Hostname", "Port", "State", "Service", "Banner",
-                         "Scan Type", "CVE Suggestions", "Latency (ms)", "OS", "Cert Info"])
+                         "Scan Type", "CVE Suggestions", "Latency (ms)", "OS", "Cert Info",
+                         "CDN Provider", "Via CDN", "CDN Confidence"])
         for target_data in scan_data.get("targets", []):
             tgt = target_data["target"]
             ip = target_data.get("ip", "")
             hostname = target_data.get("hostname", "")
             os_detect = target_data.get("os_detection", "")
+            cdn_info = target_data.get("cdn_info") or {}
+            target_cdn_prov = cdn_info.get("provider") or ""
+            target_cdn_conf = cdn_info.get("confidence") or ""
             for r in target_data["results"]:
                 cert_str = ""
                 if r.get("cert_info"):
@@ -1112,7 +1554,10 @@ def export_csv(scan_data, filename):
                 writer.writerow([
                     tgt, ip, hostname, r["port"], r["state"], r["service"],
                     r["banner"], r["scan_type"], "; ".join(r["cves"]),
-                    r.get("latency_ms", ""), os_detect, cert_str
+                    r.get("latency_ms", ""), os_detect, cert_str,
+                    r.get("cdn_provider") or target_cdn_prov,
+                    "yes" if r.get("via_cdn") else "no",
+                    target_cdn_conf,
                 ])
 
 
@@ -1135,10 +1580,14 @@ def generate_html_report(scan_data, lang_code="en"):
     else:
         logo_html = ''
 
-    # Collect all results across targets
+    # Collect all results across targets. Include CDN-filtered ports too so
+    # they appear in the main "Open Ports" table — they are already tagged
+    # with via_cdn and render with a "via <Provider>" badge, so users see them
+    # clearly labeled rather than getting an empty section.
     all_results = []
     for td in scan_data.get("targets", []):
-        for r in td["results"]:
+        combined = list(td["results"]) + list(td.get("cdn_filtered_ports") or [])
+        for r in combined:
             r["_target"] = td["target"]
             r["_ip"] = td.get("ip", td["target"])
             r["_hostname"] = td.get("hostname", "")
@@ -1147,6 +1596,7 @@ def generate_html_report(scan_data, lang_code="en"):
 
     # Per-target summary rows (compact table — works for 1 or 500+ targets)
     targets_rows_html = ""
+    cdn_targets_evidence = []  # collect for a dedicated CDN callout below the table
     for td in scan_data.get("targets", []):
         hn = td.get("hostname", "")
         os_d = td.get("os_detection", "") or "—"
@@ -1154,14 +1604,88 @@ def generate_html_report(scan_data, lang_code="en"):
         ip_str = td.get("ip", "")
         open_count = td.get("open_count", 0)
         hn_cell = html_escape(hn) if hn else f'<span class="text-muted">{html_escape(L["hostname_not_found"])}</span>'
-        open_cls = "badge-open" if open_count > 0 else "badge-neutral"
+        filtered_count = len(td.get("cdn_filtered_ports") or [])
+        effective_open = open_count + filtered_count
+        open_cls = "badge-open" if effective_open > 0 else "badge-neutral"
+        open_display = f"{open_count}" if filtered_count == 0 else f"{open_count} <span class='text-muted'>(+{filtered_count} CDN)</span>"
+        cdn = td.get("cdn_info") or {}
+        cdn_cell = ""
+        if cdn.get("is_cdn"):
+            prov = html_escape(cdn.get("provider", "Unknown"))
+            conf = html_escape(cdn.get("confidence", "low"))
+            cdn_cell = f'<span class="cdn-badge cdn-{conf}" title="Confidence: {conf}">⚠ {prov}</span>'
+            cdn_targets_evidence.append((tgt_name, ip_str, cdn))
+        else:
+            cdn_cell = '<span class="text-muted">—</span>'
         targets_rows_html += f"""<tr>
 <td class="mono" title="{html_escape(tgt_name)}">{html_escape(tgt_name)}</td>
 <td class="mono" title="{html_escape(ip_str)}">{html_escape(ip_str)}</td>
 <td title="{html_escape(hn)}">{hn_cell}</td>
 <td title="{html_escape(os_d)}"><span class="os-badge">{html_escape(os_d)}</span></td>
-<td><span class="badge {open_cls}">{open_count}</span></td>
+<td>{cdn_cell}</td>
+<td><span class="badge {open_cls}">{open_display}</span></td>
 </tr>\n"""
+
+    # Build a dedicated CDN advisory section if any target was behind a CDN.
+    # When --filter-cdn is active, the suppressed ports are still shown here
+    # inside a collapsible table so the user sees what was classified as CDN
+    # edge (nothing is silently hidden from the UI).
+    cdn_section_html = ""
+    total_filtered_ports = 0
+    if cdn_targets_evidence:
+        rows = ""
+        for td in scan_data.get("targets", []):
+            c = td.get("cdn_info") or {}
+            if not c.get("is_cdn"):
+                continue
+            tname = td.get("target", "")
+            tip = td.get("ip", "")
+            evid_items = "".join(f"<li>{html_escape(e)}</li>" for e in c.get("evidence", []))
+
+            # Filtered ports (from --filter-cdn) rendered inside a <details> block
+            filtered = td.get("cdn_filtered_ports") or []
+            total_filtered_ports += len(filtered)
+            filtered_block = ""
+            if filtered:
+                fr = ""
+                for fp in filtered:
+                    fb = html_escape((fp.get("banner") or "")[:80]) or '<span class="text-muted">—</span>'
+                    fr += f"""<tr>
+<td><span class="port-num">{fp.get('port','?')}</span></td>
+<td><span class="badge badge-service">{html_escape(fp.get('service','?'))}</span></td>
+<td class="banner-cell">{fb}</td>
+<td>{fp.get('latency_ms','?')}ms</td>
+<td><span class="cdn-badge cdn-low">via {html_escape(fp.get('cdn_provider') or c.get('provider','CDN'))}</span></td>
+</tr>"""
+                filtered_block = f"""
+<details class="cdn-filtered-details" open>
+<summary>Suppressed by <code>--filter-cdn</code>: {len(filtered)} CDN edge port(s)</summary>
+<table class="xl-table cdn-filtered-table"><thead><tr>
+<th>Port</th><th>Service</th><th>Banner</th><th>Latency</th><th>Classification</th>
+</tr></thead><tbody>{fr}</tbody></table>
+</details>"""
+
+            rows += f"""<div class="cdn-card">
+<div class="cdn-card-head"><strong>{html_escape(tname)}</strong> <span class="mono">({html_escape(tip)})</span> →
+<span class="cdn-badge cdn-{html_escape(c.get('confidence','low'))}">{html_escape(c.get('provider','Unknown'))}</span>
+<span class="text-muted">· confidence: {html_escape(c.get('confidence','low'))}</span></div>
+<ul class="cdn-evidence">{evid_items}</ul>
+{filtered_block}
+</div>"""
+        filter_note = ""
+        if total_filtered_ports > 0:
+            filter_note = (f' <strong>{total_filtered_ports} port{"s" if total_filtered_ports != 1 else ""} '
+                           f'classified as CDN edge</strong> were suppressed from the main table and are listed below.')
+        cdn_section_html = f"""
+<section class="cdn-advisory">
+  <h2>⚠ CDN / Reverse Proxy Detected</h2>
+  <p class="cdn-warn">The targets below sit behind a CDN/WAF. The open ports shown reflect the
+  <strong>CDN edge</strong>, not the real origin server. Vulnerability findings on these ports
+  describe the CDN, not your application. To audit the origin you must first identify the
+  origin IP (e.g. via historical DNS, certificate transparency logs, or direct access).{filter_note}</p>
+  {rows}
+</section>
+"""
 
     all_cves = {}
     for r in all_results:
@@ -1171,6 +1695,12 @@ def generate_html_report(scan_data, lang_code="en"):
             all_cves[cve_id]["ports"].append(f"{r['_target']}:{r['port']}")
 
     total_open = len(all_results)
+    # Count CDN-filtered ports so the "Open Ports" stat reflects real findings,
+    # not just post-filter residue. When --filter-cdn removes everything, users
+    # should still see "0 origin / 4 CDN" instead of a bare "0".
+    total_cdn_filtered = 0
+    for td in scan_data.get("targets", []):
+        total_cdn_filtered += len(td.get("cdn_filtered_ports") or [])
     avg_latency = sum(r.get("latency_ms", 0) for r in all_results) / len(all_results) if all_results else 0
 
     # Build table rows
@@ -1198,9 +1728,13 @@ def generate_html_report(scan_data, lang_code="en"):
             cert_info_html = f'<span class="badge badge-cert">{status} {cn}</span>'
 
         host_col = html_escape(r.get("_hostname") or r.get("_ip") or r.get("_target") or "")
+        cdn_row_badge = ""
+        if r.get("via_cdn"):
+            prov = html_escape(r.get("cdn_provider") or "CDN")
+            cdn_row_badge = f' <span class="cdn-badge cdn-low" title="This port is served by the CDN edge, not the origin">via {prov}</span>'
         rows_html += f"""<tr>
 <td class="host-cell" title="{host_col}">{host_col}</td>
-<td><span class="port-num">{r['port']}</span></td>
+<td><span class="port-num">{r['port']}</span>{cdn_row_badge}</td>
 <td><span class="badge badge-service">{html_escape(r['service'])}</span></td>
 <td><span class="badge badge-open">● OPEN</span></td>
 <td class="banner-cell" title="{banner_full}">{banner_safe}</td>
@@ -1249,14 +1783,16 @@ class="cve-link">{html_escape(cve_id)}</a></h3>
 <div class="filter-bar">
 <input type="text" id="targets-filter" placeholder="🔍 {html_escape(L['search_placeholder'])}" /></div>
 <div class="table-wrap table-wrap-targets"><table class="xl-table" data-table="targets"><colgroup>
-<col style="width:200px"><col style="width:180px"><col style="width:240px"><col style="width:180px"><col style="width:90px">
+<col style="width:200px"><col style="width:180px"><col style="width:240px"><col style="width:180px"><col style="width:160px"><col style="width:90px">
 </colgroup><thead><tr>
 <th>{html_escape(L['target'])}</th>
 <th>{html_escape(L['ip_address'])}</th>
 <th>{html_escape(L['hostname'])}</th>
 <th>{html_escape(L['os_detected'])}</th>
+<th>CDN / Proxy</th>
 <th>{html_escape(L['open_count'])}</th>
 </tr></thead><tbody>{targets_rows_html}</tbody></table></div>
+{cdn_section_html}
 </div>"""
     else:
         targets_section = ""
@@ -1366,6 +1902,25 @@ font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em;wh
 .banner-cell{{font-family:'JetBrains Mono',monospace;font-size:.76rem;color:var(--t2);}}
 .cve-list{{display:flex;gap:.3rem;flex-wrap:wrap;}}
 .text-muted{{color:var(--tm);font-size:.8rem;}}
+.cdn-badge{{display:inline-block;padding:.2rem .55rem;border-radius:6px;font-size:.72rem;font-weight:600;letter-spacing:.02em;}}
+.cdn-high{{background:rgba(239,68,68,.18);color:#fca5a5;border:1px solid rgba(239,68,68,.35);}}
+.cdn-medium{{background:rgba(245,158,11,.18);color:#fcd34d;border:1px solid rgba(245,158,11,.35);}}
+.cdn-low{{background:rgba(148,163,184,.18);color:#cbd5e1;border:1px solid rgba(148,163,184,.3);}}
+.cdn-advisory{{margin:2rem 0;padding:1.5rem 1.75rem;background:linear-gradient(135deg,rgba(245,158,11,.08),rgba(239,68,68,.05));
+border:1px solid rgba(245,158,11,.25);border-radius:14px;animation:fadeUp .6s ease-out;}}
+.cdn-advisory h2{{font-size:1.1rem;font-weight:700;color:#fcd34d;margin-bottom:.5rem;}}
+.cdn-warn{{font-size:.88rem;color:var(--t2);margin-bottom:1rem;line-height:1.55;}}
+.cdn-card{{background:rgba(0,0,0,.2);border:1px solid var(--brd);border-radius:10px;padding:.85rem 1rem;margin-top:.65rem;}}
+.cdn-card-head{{font-size:.88rem;margin-bottom:.4rem;}}
+.cdn-evidence{{font-size:.78rem;color:var(--t2);padding-left:1.2rem;}}
+.cdn-evidence li{{margin:.15rem 0;}}
+.cdn-filtered-details{{margin-top:.75rem;background:rgba(0,0,0,.25);border-radius:8px;padding:.6rem .9rem;}}
+.cdn-filtered-details summary{{cursor:pointer;font-size:.82rem;color:var(--t2);font-weight:500;padding:.25rem 0;}}
+.cdn-filtered-details summary:hover{{color:var(--t1);}}
+.cdn-filtered-details code{{background:rgba(0,0,0,.3);padding:.1rem .4rem;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.78rem;}}
+.cdn-filtered-table{{margin-top:.6rem;}}
+.cdn-filtered-table td{{padding:.5rem .75rem;font-size:.82rem;}}
+.sv-sub{{font-size:.7rem;color:var(--amber);font-weight:500;margin-left:.3rem;vertical-align:middle;}}
 .cve-section{{animation:fadeUp .6s ease-out .5s both;}}
 .cve-card{{display:flex;align-items:flex-start;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid rgba(255,255,255,.03);}}
 .cve-card:last-child{{border-bottom:none;}}
@@ -1400,13 +1955,13 @@ thead th,tbody td{{padding:.6rem .8rem;}}}}
 </div></div>
 <div class="stats">
 <div class="sc"><div class="sl">{L['ports_scanned']}</div><div class="sv">{meta.get('total_ports',0)}</div></div>
-<div class="sc"><div class="sl">{L['open_ports']}</div><div class="sv">{total_open}</div></div>
+<div class="sc"><div class="sl">{L['open_ports']}</div><div class="sv">{total_open}{f' <span class="sv-sub">+{total_cdn_filtered} CDN</span>' if total_cdn_filtered else ''}</div></div>
 <div class="sc"><div class="sl">{L['duration']}</div><div class="sv">{duration_str}</div></div>
 <div class="sc"><div class="sl">{L['avg_latency']}</div><div class="sv">{avg_latency:.1f}ms</div></div>
 </div>
 {targets_section}
 <div class="section">
-<div class="section-header"><h2>📡 {L['open_ports']}</h2><span class="count">{total_open}</span></div>
+<div class="section-header"><h2>📡 {L['open_ports']}</h2><span class="count">{total_open}{f' (+{total_cdn_filtered} CDN)' if total_cdn_filtered else ''}</span></div>
 {table_content}
 </div>
 {cve_section}
@@ -1887,6 +2442,7 @@ def main():
         description="Canavar Port Scanner v2026 - Cross-Platform Network Recon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
+  python canavar.py --auto --top-ports 100
   python canavar.py -t 192.168.1.1 -p 1-1024
   python canavar.py -t scanme.nmap.org --top-ports 100
   python canavar.py -t 10.0.0.0/24 -p 22,80,443 --lang en
@@ -1899,8 +2455,14 @@ def main():
   python canavar.py -t target.com --timing 2 --retries 2
   python canavar.py -t target.com --update-cve --nvd-api-key YOUR_KEY"""
     )
-    parser.add_argument("-t", "--target", required=True,
-                        help="Target IP, hostname, IPv6, or CIDR (e.g. 192.168.1.0/24 or 2001:db8::1)")
+    parser.add_argument("-t", "--target", default=None,
+                        help="Target IP, hostname, IPv6, or CIDR (e.g. 192.168.1.0/24 or 2001:db8::1). "
+                             "Not required when --auto is used.")
+    parser.add_argument("--auto", action="store_true",
+                        help="Auto-detect the local network and scan it (typically /24). "
+                             "Enables --discovery by default. Use with caution — only scan networks you own.")
+    parser.add_argument("--auto-prefix", type=int, default=24, metavar="N",
+                        help="CIDR prefix length for --auto (default: 24 = /24 subnet)")
     parser.add_argument("-p", "--ports", default="1-1024",
                         help="Port range: 1-1024, 22,80,443, or 22,80,8000-9000")
     parser.add_argument("--top-ports", type=int, default=None, metavar="N",
@@ -1949,11 +2511,24 @@ def main():
                         help="Update CVE database from NVD API")
     parser.add_argument("--nvd-api-key", metavar="KEY",
                         help="NVD API key for higher rate limits")
+    parser.add_argument("--filter-cdn", action="store_true",
+                        help="Filter out CDN/proxy edge ports from main report (Cloudflare, "
+                             "Fastly, Akamai, CloudFront, etc.). Suppressed ports remain "
+                             "available under 'cdn_filtered_ports' in the JSON export for audit.")
+    parser.add_argument("--update-cdn-ranges", action="store_true",
+                        help="Refresh CDN IP ranges from authoritative sources (CF, Fastly, AWS). "
+                             "Cached for 7 days. Baked-in snapshot used otherwise.")
 
     args = parser.parse_args()
 
     lang_code = args.lang
     L = LANG[lang_code]
+
+    # Validate target/auto combination
+    if not args.target and not args.auto:
+        parser.error("Either -t/--target or --auto is required.")
+    if args.target and args.auto:
+        parser.error("-t/--target and --auto are mutually exclusive.")
 
     # Setup verbose logging
     if args.verbose:
@@ -1963,6 +2538,22 @@ def main():
 
     # Print banner
     cprint(BANNER_ART, C.CYAN)
+
+    # --auto: detect local subnet and enable host discovery by default
+    if args.auto:
+        cprint("[*] Auto-detecting local network...", C.CYAN)
+        cidr, local_ip = detect_local_network(prefix=args.auto_prefix)
+        if not cidr:
+            cprint(f"[!] Could not detect a routable local network (got {local_ip}). "
+                   f"Connect to a network and try again, or specify -t manually.", C.RED)
+            sys.exit(1)
+        args.target = cidr
+        cprint(f"[*] Local IP detected: {local_ip}", C.GREEN)
+        cprint(f"[*] Scanning local network: {cidr}", C.GREEN)
+        cprint("[!] LEGAL WARNING: Only proceed if you are authorized to scan this network.", C.YELLOW)
+        # Host discovery dramatically speeds up /24 scans — enable by default
+        if not args.skip_discovery:
+            args.discovery = True
 
     # Apply timing profile if specified
     threads = args.threads or 200
@@ -1978,13 +2569,28 @@ def main():
     else:
         timing_name = None
 
-    # Update CVE database if requested
+    # Refresh CDN ranges if requested (fetches CF/Fastly/AWS authoritative lists)
+    if args.update_cdn_ranges:
+        try:
+            update_cdn_ranges(lang_code)
+        except Exception as e:
+            logger.debug("update_cdn_ranges failed: %s", e)
+            cprint("[!] CDN range update failed — using baked-in snapshot", C.YELLOW)
+
+    # Update CVE database if requested; otherwise transparently merge any
+    # previously-cached NVD data so --update-cve results persist across runs.
     global CVE_DATABASE
     if args.update_cve:
         try:
-            CVE_DATABASE = update_cve_database(args.nvd_api_key, lang_code)
-        except Exception:
+            CVE_DATABASE = update_cve_database(args.nvd_api_key, lang_code, verbose=args.verbose)
+        except Exception as e:
+            logger.debug("update_cve_database failed: %s", e)
             cprint(L["cve_update_failed"], C.YELLOW)
+    else:
+        try:
+            CVE_DATABASE = get_effective_cve_database()
+        except Exception as e:
+            logger.debug("get_effective_cve_database failed: %s", e)
 
     # SYN scan checks
     use_syn = args.syn
@@ -2122,12 +2728,49 @@ def main():
                 if os_detection:
                     cprint(f"[*] {L['os_detected']}: {os_detection}", C.CYAN)
 
-            scan_data["targets"].append({
+            # CDN / reverse proxy detection (IP range + banner fingerprints)
+            cdn_info = detect_cdn_for_target(ip, results)
+            if cdn_info["is_cdn"]:
+                cprint(
+                    f"[!] CDN/Proxy detected: {cdn_info['provider']} "
+                    f"(confidence: {cdn_info['confidence']}) — open ports reflect CDN edge, not origin",
+                    C.YELLOW,
+                )
+                for ev in cdn_info["evidence"][:3]:
+                    cprint(f"    • {ev}", C.DIM)
+
+            # Tag each port result with CDN membership so reports can filter/flag
+            final_results = []
+            for r in results:
+                port_banner = r.get("banner", "")
+                port_provider, _ = classify_banner_cdn(port_banner)
+                via_cdn = cdn_info["is_cdn"] and (
+                    port_provider is not None
+                    or r.get("port") in CDN_EDGE_PORT_SET
+                    or classify_ip_cdn(ip) is not None
+                )
+                r["via_cdn"] = bool(via_cdn)
+                r["cdn_provider"] = port_provider or (cdn_info["provider"] if via_cdn else None)
+                # Apply --filter-cdn: suppress CDN-only ports from main results
+                if getattr(args, "filter_cdn", False) and via_cdn:
+                    continue
+                final_results.append(r)
+
+            target_entry = {
                 "target": display_name, "ip": ip,
                 "hostname": hostname or "",
-                "results": results, "open_count": len(results),
+                "results": final_results,
+                "open_count": len(final_results),
                 "os_detection": os_detection or "Unknown",
-            })
+                "cdn_info": cdn_info,
+            }
+            # If filtering, keep the suppressed ports under a separate key so they
+            # remain auditable in the JSON export (never silently discarded)
+            if getattr(args, "filter_cdn", False) and cdn_info["is_cdn"]:
+                target_entry["cdn_filtered_ports"] = [
+                    r for r in results if r.get("via_cdn")
+                ]
+            scan_data["targets"].append(target_entry)
 
     except KeyboardInterrupt:
         cprint(L["interrupted"], C.RED)
@@ -2146,7 +2789,10 @@ def main():
     scan_data["metadata"]["duration_seconds"] = elapsed
 
     total_open = sum(t["open_count"] for t in scan_data["targets"])
+    total_cdn_filtered = sum(len(t.get("cdn_filtered_ports") or []) for t in scan_data["targets"])
     cprint(f"\n{L['scan_finished'].format(count=total_open, elapsed=elapsed)}", C.GREEN + C.BOLD)
+    if total_cdn_filtered > 0:
+        cprint(f"    (+{total_cdn_filtered} CDN edge port(s) suppressed by --filter-cdn — see report)", C.DIM)
 
     # Vulnerability Assessment
     if args.vuln_scan:

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  syntax-and-import:
+    name: Syntax + import check (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.7", "3.9", "3.11", "3.12"]
+        exclude:
+          # Python 3.7 not available on macos-latest / ubuntu-latest runners
+          - os: macos-latest
+            python-version: "3.7"
+          - os: ubuntu-latest
+            python-version: "3.7"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install optional dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install tqdm colorama Pillow
+
+      - name: Compile-check (catches syntax errors)
+        run: python -m py_compile canavar.py
+
+      - name: Run --help (smoke test the CLI)
+        run: python canavar.py --help
+
+      - name: Loopback scan smoke test
+        shell: bash
+        run: |
+          python canavar.py -t 127.0.0.1 -p 1,2,3 --lang en \
+            -o ci_smoke --output-dir ./ci_artifacts --timeout 0.5
+          ls -la ./ci_artifacts/
+          test -f ./ci_artifacts/ci_smoke.json
+          test -f ./ci_artifacts/ci_smoke.csv
+          test -f ./ci_artifacts/ci_smoke.html
+
+      - name: Validate JSON output
+        shell: bash
+        run: |
+          python -c "import json; json.load(open('./ci_artifacts/ci_smoke.json'))"
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check (non-blocking, informational)
+        run: ruff check canavar.py --select=E9,F63,F7,F82 --output-format=github
+        continue-on-error: true
