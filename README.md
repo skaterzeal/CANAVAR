@@ -2,7 +2,7 @@
 
 > **Zero-dependency** cross-platform port scanner with live dashboard, vulnerability assessment, and stunning HTML reports.
 
-**Platforms:** Windows · macOS · Kali Linux · Any Python 3.7+
+**Platforms:** Cross-Platform · Any Python 3.7+
 
 ---
 

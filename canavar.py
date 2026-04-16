@@ -2,8 +2,8 @@
 """
 Canavar Port Scanner v2026
 Cross-platform network reconnaissance tool.
-Supports TCP Connect & SYN scan, UDP scan, banner grabbing, CVE suggestions,
-CIDR ranges, multi-threading, OS detection, SSL analysis, and beautiful HTML/JSON/CSV reports.
+Supports TCP Connect & SYN scan, UDP scan, Banner grabbing, CVE suggestions,
+CIDR ranges, Multi-threading, OS detection, SSL analysis, and HTML/JSON/CSV reports.
 """
 
 import socket
